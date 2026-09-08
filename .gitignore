@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+wandb/
+tb/
+results*/
+checkpoints*/
+datasets/
+*.pt
+*.npz
+*.out
+*.log
+*.bak*
+.DS_Store

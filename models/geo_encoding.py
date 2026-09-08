@@ -1,0 +1,696 @@
+"""Sphere-aware multiresolution hash-grid geographic encoding.
+
+Encodes static geography (lat, lon, [altitude]) into a learned, multi-resolution
+embedding (Müller et al. 2022, "Instant Neural Graphics Primitives" hash grid),
+used here as a *positional / conditioning* signal — NOT as the atmosphere
+representation itself. The embedding is concatenated as extra input channels to
+the diffusion UNet so the noise predictor can exploit location-specific structure
+(orography, land-sea contrast, latitude effects) when reconstructing.
+
+Design choices motivated by the atmosphere being a sphere:
+  - latitude/longitude are mapped to unit-sphere Cartesian (x, y, z) before
+    hashing, so there is no discontinuity at the dateline and no pole
+    over-sampling (a raw lat/lon grid would have both).
+  - coarse levels index a dense table; fine levels use the spatial hash with a
+    bounded table (collisions resolved by the downstream network), exactly as in
+    Instant-NGP.
+
+This is a static encoding: one table is shared across all timesteps / dates, so
+unlike using a hash grid to represent a (time-varying) field, there is no
+per-sample fitting.
+"""
+
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+
+# Large primes for the spatial hash (Instant-NGP); pi_1 = 1 by convention.
+_PRIMES = [1, 2654435761, 805459861, 3674653429]
+
+# Default static physiographic conditioning fields (all in the WB2 ERA5 zarr).
+DEFAULT_STATIC_FIELDS = ["geopotential_at_surface", "land_sea_mask",
+                         "slope_of_sub_gridscale_orography"]
+
+
+def latlon_to_unit_sphere(lat_deg, lon_deg):
+    """(lat, lon) in degrees -> unit-sphere Cartesian (x, y, z) in [-1, 1].
+
+    Accepts numpy arrays or torch tensors of matching shape; returns the same
+    type, stacked along a new last dimension.
+    """
+    is_torch = isinstance(lat_deg, torch.Tensor)
+    if is_torch:
+        lat = torch.deg2rad(lat_deg); lon = torch.deg2rad(lon_deg)
+        x = torch.cos(lat) * torch.cos(lon)
+        y = torch.cos(lat) * torch.sin(lon)
+        z = torch.sin(lat)
+        return torch.stack([x, y, z], dim=-1)
+    lat = np.deg2rad(lat_deg); lon = np.deg2rad(lon_deg)
+    x = np.cos(lat) * np.cos(lon)
+    y = np.cos(lat) * np.sin(lon)
+    z = np.sin(lat)
+    return np.stack([x, y, z], axis=-1)
+
+
+def build_patch_coords(lat_vec, lon_vec, altitude=None, input_dim=3):
+    """Per-pixel normalized coordinates for one patch.
+
+    Args:
+        lat_vec: (H,) latitudes in degrees for the patch rows.
+        lon_vec: (W,) longitudes in degrees for the patch cols.
+        altitude: optional scalar in [0, 1] appended as a 4th coordinate
+            (constant for a single-level variable like Z500). 3-D mode only.
+        input_dim: 3 (default) for unit-sphere xyz; 2 for plate-carree
+            (lat, lon), used by the 2-D hash arm.
+
+    Returns:
+        (H, W, d) float32 coordinates in [0, 1], d = input_dim (or 4 with
+        altitude on top of the 3-D mode).
+
+    The 2-D mode trades the sphere-native properties for table utilization:
+    (lat+90)/180 and lon/360 have a real discontinuity at the prime meridian
+    (adjacent columns at lon 359.75 and 0 receive distant coordinates) and no
+    equal-area treatment of the poles — both of which the xyz embedding avoids
+    by construction. In exchange, a 2-D grid over [0,1]^2 has no third axis to
+    waste: the 3-D grid spends ~84% of its entries on volume cells the 2-D
+    sphere surface never touches. No seam ever falls INSIDE a patch (patch
+    columns are a contiguous slice of the 0..360 grid), so the discontinuity
+    only separates patches on opposite sides of the meridian.
+    """
+    if input_dim == 2:
+        assert altitude is None, "altitude requires the 3-D (xyz) mode"
+        lat_g, lon_g = np.meshgrid(lat_vec, lon_vec, indexing="ij")   # (H, W)
+        lat01 = (lat_g.astype(np.float32) + 90.0) / 180.0
+        lon01 = np.mod(lon_g.astype(np.float32), 360.0) / 360.0
+        return np.stack([lat01, lon01], axis=-1)                      # (H, W, 2)
+    lat_g, lon_g = np.meshgrid(lat_vec, lon_vec, indexing="ij")  # (H, W)
+    xyz = latlon_to_unit_sphere(lat_g, lon_g).astype(np.float32)  # (H, W, 3) in [-1,1]
+    coords = (xyz + 1.0) * 0.5                                    # -> [0, 1]
+    if altitude is not None:
+        h, w = coords.shape[:2]
+        alt = np.full((h, w, 1), float(altitude), dtype=np.float32)
+        coords = np.concatenate([coords, alt], axis=-1)
+    return coords
+
+
+def build_latlon_support(lat_vec, lon_vec, altitude=None):
+    """Every coordinate the dataset can ever query, as (P, d) float32.
+
+    Patches are contiguous crops of this same full grid and build_patch_coords
+    is elementwise, so a crop reproduces these float32 values bit-for-bit — the
+    reason the compact grid's touched-vertex enumeration is exact rather than
+    approximate. Factored out of build_geo_encoder so it can be tested, and so
+    an encoder can be constructed without the dataset present on disk.
+    """
+    coords = build_patch_coords(lat_vec, lon_vec, altitude=altitude)
+    return torch.from_numpy(coords.reshape(-1, coords.shape[-1]))
+
+
+class MultiResHashGrid(nn.Module):
+    """Multiresolution hash-grid encoder for d-dimensional coordinates in [0,1]^d."""
+
+    def __init__(self, input_dim=3, n_levels=12, n_features_per_level=2,
+                 log2_hashmap_size=19, base_resolution=16, finest_resolution=512):
+        super().__init__()
+        assert 1 <= input_dim <= 4, "input_dim must be in [1, 4]"
+        self.d = input_dim
+        self.L = n_levels
+        self.F = n_features_per_level
+        self.output_dim = n_levels * n_features_per_level
+        T = 2 ** log2_hashmap_size
+
+        if n_levels > 1:
+            b = np.exp((np.log(finest_resolution) - np.log(base_resolution)) / (n_levels - 1))
+        else:
+            b = 1.0
+
+        resolutions, is_dense, tables = [], [], nn.ParameterList()
+        for l in range(n_levels):
+            n = int(np.floor(base_resolution * (b ** l)))
+            cells = (n + 1) ** self.d
+            dense = cells <= T
+            n_entries = cells if dense else T
+            resolutions.append(n)
+            is_dense.append(dense)
+            tables.append(nn.Parameter(torch.empty(n_entries, self.F).uniform_(-1e-4, 1e-4)))
+        self.resolutions = resolutions
+        self.is_dense = is_dense
+        self.tables = tables
+
+        self.register_buffer("primes", torch.tensor(_PRIMES[: self.d], dtype=torch.long))
+        # Corner offsets for d-linear interpolation: (2^d, d).
+        corners = torch.tensor(
+            [[(c >> i) & 1 for i in range(self.d)] for c in range(2 ** self.d)],
+            dtype=torch.long,
+        )
+        self.register_buffer("corner_offsets", corners)
+
+    def _index(self, corner, n, dense, n_entries):
+        """Map integer corner coords (P, d) -> table indices (P,)."""
+        if dense:
+            stride = 1
+            idx = torch.zeros(corner.shape[0], dtype=torch.long, device=corner.device)
+            for i in range(self.d):
+                idx = idx + corner[:, i] * stride
+                stride *= (n + 1)
+            return idx
+        h = torch.zeros(corner.shape[0], dtype=torch.long, device=corner.device)
+        for i in range(self.d):
+            h = torch.bitwise_xor(h, corner[:, i] * self.primes[i])
+        return h % n_entries
+
+    def forward(self, coords):
+        """coords: (..., d) in [0, 1] -> (..., L*F) embedding."""
+        lead = coords.shape[:-1]
+        x = coords.reshape(-1, self.d).clamp(0.0, 1.0)  # (P, d)
+        p = x.shape[0]
+        outs = []
+        for l in range(self.L):
+            n = self.resolutions[l]
+            table = self.tables[l]
+            n_entries = table.shape[0]
+            dense = self.is_dense[l]
+            pos = x * n                                  # (P, d) in [0, n]
+            base = torch.floor(pos).long()               # (P, d)
+            local = pos - base.float()                   # (P, d)
+            feat = torch.zeros(p, self.F, device=x.device, dtype=table.dtype)
+            for off in self.corner_offsets:              # (d,)
+                corner = (base + off).clamp(0, n)        # (P, d)
+                w = torch.ones(p, device=x.device, dtype=table.dtype)
+                for i in range(self.d):
+                    w = w * torch.where(off[i].bool(), local[:, i], 1.0 - local[:, i])
+                idx = self._index(corner, n, dense, n_entries)
+                feat = feat + w.unsqueeze(-1) * table[idx]
+            outs.append(feat)
+        out = torch.cat(outs, dim=-1)                    # (P, L*F)
+        return out.reshape(*lead, self.output_dim)
+
+
+class CompactMultiResHashGrid(MultiResHashGrid):
+    """MultiResHashGrid storing only the lattice vertices the data can touch.
+
+    `support` is (P, d) float in [0,1]: every coordinate the dataset will ever
+    query (the full band grid). Per level, the union of the 2^d trilinear
+    corner vertices over the support is enumerated; levels where that count is
+    smaller than the existing table are re-allocated to exactly that count,
+    with a sorted linear-id buffer for lookup (binary search, no collisions).
+    Buffers and resized tables persist in checkpoints; reconstruction at eval
+    passes the same support, so shapes match at load_state_dict time.
+
+    Lookup uses a precomputed dense `linear id -> slot` map where one fits in
+    MAX_MAP entries, falling back to the sorted-id binary search above it.
+    Measured on a GH200 at the real training shape (524,288 query points,
+    forward+backward): binary search 1.44x the plain grid, the map 1.01x —
+    torch.searchsorted over ~129k sorted ids for every query point, 8 corners x
+    8 levels, was the whole overhead, not the host sync it was first blamed on.
+    Off-support entries are PRE-FILLED with their hash slot, so the lookup is a
+    single gather with no branch and no device-to-host sync, and is bit-identical
+    to the search path.
+
+    The maps are non-persistent buffers: they are pure functions of the support,
+    so rebuilding them costs ~2 s at construction and keeps them out of every
+    3.9 GB checkpoint — which also means checkpoints written before this change
+    still load.
+    """
+
+    MAX_MAP = 1 << 24     # 134 MiB at int64; above this the search path is
+                          # cheaper than materializing the map
+
+    def __init__(self, support, **kwargs):
+        super().__init__(**kwargs)
+        assert support is not None and support.shape[-1] == self.d
+        sup = torch.as_tensor(support, dtype=torch.float32).reshape(-1, self.d)
+        sup = sup.clamp(0.0, 1.0)
+        self.compact = []
+        for l in range(self.L):
+            n = self.resolutions[l]
+            base = torch.floor(sup * n).long().clamp(max=n - 1)
+            ids = []
+            for off in self.corner_offsets:
+                corner = (base + off).clamp(0, n)
+                ids.append(self._linear_id(corner, n))
+            ids = torch.unique(torch.cat(ids))
+            if ids.numel() < self.tables[l].shape[0]:
+                self.tables[l] = nn.Parameter(
+                    torch.empty(ids.numel(), self.F).uniform_(-1e-4, 1e-4))
+                self.register_buffer(f"support_{l}", ids)
+                self.compact.append(True)
+            else:
+                self.register_buffer(f"support_{l}",
+                                     torch.zeros(0, dtype=torch.long))
+                self.compact.append(False)
+        self._build_index_maps()
+
+    def _build_index_maps(self):
+        """Dense linear-id -> slot per level, off-support slots pre-hashed."""
+        self.use_map = []
+        for l in range(self.L):
+            n = self.resolutions[l]
+            cells = (n + 1) ** self.d
+            if not self.compact[l] or cells > self.MAX_MAP:
+                self.register_buffer(f"map_{l}", torch.zeros(0, dtype=torch.long),
+                                     persistent=False)
+                self.use_map.append(False)
+                continue
+            ids = self.get_buffer(f"support_{l}")
+            n_entries = self.tables[l].shape[0]
+            lin = torch.arange(cells, dtype=torch.long)
+            rem, corner = lin, []
+            for _ in range(self.d):
+                corner.append(rem % (n + 1))
+                rem = rem // (n + 1)
+            h = torch.zeros(cells, dtype=torch.long)
+            for i in range(self.d):
+                h = torch.bitwise_xor(h, corner[i] * self.primes[i])
+            m = h % n_entries                       # off-support fallback
+            m[ids] = torch.arange(ids.numel(), dtype=torch.long)   # on-support
+            self.register_buffer(f"map_{l}", m, persistent=False)
+            self.use_map.append(True)
+
+    def _linear_id(self, corner, n):
+        stride = 1
+        idx = torch.zeros(corner.shape[0], dtype=torch.long,
+                          device=corner.device)
+        for i in range(self.d):
+            idx = idx + corner[:, i] * stride
+            stride *= (n + 1)
+        return idx
+
+    def _index_level(self, corner, l, n, n_entries):
+        if not self.compact[l]:
+            return super()._index(corner, n, self.is_dense[l], n_entries)
+        if self.use_map[l]:
+            return self.get_buffer(f"map_{l}")[self._linear_id(corner, n)]
+        sup = self.get_buffer(f"support_{l}")
+        lin = self._linear_id(corner, n)
+        pos = torch.searchsorted(sup, lin).clamp(max=sup.numel() - 1)
+        hit = sup[pos] == lin
+        if bool(hit.all()):
+            return pos
+        # Off-support corner (unseen grid): hash into the same compact table.
+        h = torch.zeros_like(lin)
+        for i in range(self.d):
+            h = torch.bitwise_xor(h, corner[:, i] * self.primes[i])
+        return torch.where(hit, pos, h % n_entries)
+
+    def forward(self, coords):
+        lead = coords.shape[:-1]
+        x = coords.reshape(-1, self.d).clamp(0.0, 1.0)
+        p = x.shape[0]
+        outs = []
+        for l in range(self.L):
+            n = self.resolutions[l]
+            table = self.tables[l]
+            pos = x * n
+            base = torch.floor(pos).long()
+            local = pos - base.float()
+            feat = torch.zeros(p, self.F, device=x.device, dtype=table.dtype)
+            for off in self.corner_offsets:
+                corner = (base + off).clamp(0, n)
+                w = torch.ones(p, device=x.device, dtype=table.dtype)
+                for i in range(self.d):
+                    w = w * torch.where(off[i].bool(), local[:, i], 1.0 - local[:, i])
+                idx = self._index_level(corner, l, n, table.shape[0])
+                feat = feat + w.unsqueeze(-1) * table[idx]
+            outs.append(feat)
+        return torch.cat(outs, dim=-1).reshape(*lead, self.output_dim)
+
+
+def healpix_nside_ladder(n_levels: int, nside_min: int = 1, nside_max: int = 128):
+    """Geometric ladder of integer HEALPix Nside values.
+
+    The RING scheme (the only one used here — see data/make_healpix_index.py)
+    accepts ANY integer Nside; powers of two are only required for NESTED. A
+    geometric-integer ladder lets the scale band and per-octave density match
+    the hash grid's (e.g. 8..64 over 8 levels ~ b=1.35), instead of being
+    locked to one-octave jumps. Backward compatible: (1, 128, 8 levels) still
+    yields the power-of-two ladder 1,2,4,...,128, so existing checkpoints and
+    the default healpix_index.npz are unaffected.
+
+    Shared by the encoder and data/make_healpix_index.py so the precomputed
+    indices and the tables can never disagree about level resolutions."""
+    ladder = np.exp(np.linspace(np.log(nside_min), np.log(nside_max), n_levels))
+    nsides = [int(np.rint(x)) for x in ladder]
+    assert all(b > a for a, b in zip(nsides, nsides[1:])), (
+        f"non-increasing Nside ladder {nsides}: reduce n_levels or widen the "
+        f"[nside_min, nside_max] range")
+    return nsides
+
+
+class HealpixGrid(nn.Module):
+    """Dense equal-area HEALPix feature pyramid (Gorski et al. 2005).
+
+    Sphere-native alternative to MultiResHashGrid with the same interface and
+    output_dim semantics (tables -> interpolate -> concat, no MLP head). Every
+    level is a DENSE table over the sphere's 12*Nside^2 equal-area cells — no
+    hashing, no collisions, no dense 3D volume wasted on a 2D shell. The 4
+    interpolation neighbors/weights per grid pixel are precomputed once on the
+    full lat/lon grid by data/make_healpix_index.py (the only place healpy is
+    needed); PatchDataset crops them per patch.
+
+    forward(geo) accepts either
+      - the packed float32 payload the dataset emits: (B, L, H, W, 8) =
+        [4 neighbor cell indices | 4 interp weights] — indices are exact in
+        fp32 for Nside <= 1024 (12*1024^2 < 2^24), or
+      - an (idx, w) tuple of (B, L, H, W, 4) tensors.
+    Returns (B, H, W, L*F), same as the hash encoder.
+    """
+
+    def __init__(self, n_levels=8, n_features_per_level=2,
+                 nside_min=1, nside_max=128):
+        super().__init__()
+        self.nsides = healpix_nside_ladder(n_levels, nside_min, nside_max)
+        assert self.nsides[-1] <= 1024, "fp32 index packing requires Nside <= 1024"
+        self.L = n_levels
+        self.F = n_features_per_level
+        self.output_dim = self.L * self.F
+        self.tables = nn.ParameterList(
+            nn.Parameter(torch.empty(12 * ns * ns, self.F).uniform_(-1e-4, 1e-4))
+            for ns in self.nsides
+        )
+
+    def forward(self, geo):
+        if isinstance(geo, (tuple, list)):
+            idx, w = geo
+            idx = idx.long()
+        else:
+            idx, w = geo[..., :4].long(), geo[..., 4:]
+        assert idx.dim() == 5, "expected batched (B, L, H, W, 4) healpix payload"
+        b, _, h, wd, _ = idx.shape
+        outs = []
+        for l in range(self.L):
+            f = self.tables[l][idx[:, l].reshape(-1)].view(b, h, wd, 4, self.F)
+            outs.append((f * w[:, l].unsqueeze(-1)).sum(dim=3))
+        return torch.cat(outs, dim=-1)
+
+
+class RawCoords(nn.Module):
+    """Identity 'encoder': the unit-sphere coordinates themselves as channels.
+
+    The trivial baseline for the learned tables (CoordConv-style): the UNet
+    receives exactly the information the tables index with — (x, y, z) in
+    [0, 1] per pixel — and must extract any location context itself. Zero
+    parameters."""
+
+    def __init__(self, input_dim=3):
+        super().__init__()
+        self.output_dim = input_dim
+
+    def forward(self, coords):
+        return coords
+
+
+class SinusoidalSphere(nn.Module):
+    """Fixed multiscale Fourier features of the unit-sphere coordinates.
+
+    The engineered-basis baseline (NeRF-style positional encoding on the
+    sphere-embedded coordinates; cf. CorrDiff's 'sinusoidal' grid option and
+    spherical location encoders, Russwurm et al. 2024): multiscale structure
+    like the learned tables, but zero learned parameters — isolating whether
+    the tables' gain comes from LEARNING or merely from a multiscale basis.
+    output_dim = input_dim * 2 * n_frequencies (18 for d=3, n=3 — comparable
+    to the default 16-dim hash/HEALPix embedding)."""
+
+    def __init__(self, input_dim=3, n_frequencies=3):
+        super().__init__()
+        self.d = input_dim
+        self.output_dim = input_dim * 2 * n_frequencies
+        freqs = (2.0 ** torch.arange(n_frequencies).float()) * torch.pi
+        self.register_buffer("freqs", freqs)
+
+    def forward(self, coords):
+        # coords (..., d) in [0, 1] -> [-1, 1] so frequency 2^0*pi spans one period
+        x = coords * 2.0 - 1.0
+        args = x.unsqueeze(-1) * self.freqs            # (..., d, n)
+        feats = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+        return feats.reshape(*coords.shape[:-1], self.output_dim)
+
+
+class StaticFields(nn.Module):
+    """Identity 'encoder' over precomputed static physiographic channels.
+
+    The literature-standard baseline (orography, land-sea mask, ... — Harris
+    et al. 2022, DL4DS, HiRO): real per-pixel fields from the WB2 store,
+    normalized and cropped per patch by data/make_static_fields.py +
+    PatchDataset. Zero learned geographic parameters, so no capacity to
+    memorize train-year anomalies — the strong null the learned tables must
+    beat."""
+
+    def __init__(self, n_fields):
+        super().__init__()
+        self.output_dim = n_fields
+
+    def forward(self, payload):
+        return payload
+
+
+class HashStaticCombo(nn.Module):
+    """Learned hash-grid embedding CONCATENATED with real static fields.
+
+    The discriminating arm of the geo ablation: static fields supply
+    physiography outright, so any gain of this arm over static-alone is
+    location signal the tables capture BEYOND physiography; parity means the
+    tables were physiography proxies. Payload (from PatchDataset,
+    encoder='hash_static'): (..., H, W, d + S) = [unit-sphere coords |
+    normalized static fields]."""
+
+    def __init__(self, hash_grid: "MultiResHashGrid", n_fields: int):
+        super().__init__()
+        self.hash = hash_grid
+        self.n_fields = n_fields
+        self.output_dim = hash_grid.output_dim + n_fields
+
+    def forward(self, payload):
+        coords = payload[..., : self.hash.d]
+        static = payload[..., self.hash.d:]
+        return torch.cat([self.hash(coords), static], dim=-1)
+
+
+class EncoderStaticCombo(nn.Module):
+    """Any coordinate encoder CONCATENATED with real static fields.
+
+    Generalizes HashStaticCombo to the PARAMETER-FREE coordinate encoders, so
+    the ablation can separate the three things the hash arm confounds:
+    position, physiography, and learned capacity.
+
+      xyz_static         position (linear) + physiography, zero parameters
+      sinusoidal_static  position (fixed multi-scale nonlinear) + physiography
+
+    sinusoidal_static is the tighter null for the hash grid: it matches the
+    grid's multi-scale nonlinear character and its embedding width without any
+    learned table, so a remaining hash gain cannot be explained as "the network
+    just needed better-conditioned positional features".
+
+    Payload (PatchDataset): (..., H, W, d + S) = [coords | static fields].
+    Ported verbatim from claude/wb2-20var-downscaling (2026-09-04).
+    """
+
+    def __init__(self, base: nn.Module, input_dim: int, n_fields: int):
+        super().__init__()
+        self.base = base
+        self.d = input_dim
+        self.n_fields = n_fields
+        self.output_dim = base.output_dim + n_fields
+
+    def forward(self, payload):
+        coords = payload[..., : self.d]
+        static = payload[..., self.d:]
+        return torch.cat([self.base(coords), static], dim=-1)
+
+
+class LevelGate(nn.Module):
+    """Noise-dependent per-level gating of a multiresolution geo embedding.
+
+    Diffusion-aware conditioning: g_l(u) = sigmoid((u - c_l) / w), where
+    u in [0, 1] is the SIGNAL fraction of the current sampling step (1 = clean
+    data) and c_l = l/(L-1) * c_max ramps from 0 (coarsest level, open at every
+    noise level) to c_max (finest level, open only late in denoising).
+
+    The point is a TRAINING-time regularizer against fine-scale location
+    memorization: with timesteps sampled uniformly, the fine tables currently
+    receive most of their gradient from noise-dominated steps where location
+    cannot matter — pure opportunity to fit noise/train-year anomalies. Gating
+    routes fine-level gradient to low-noise steps only. Guided inference is
+    barely affected: reconstruction chains start at u >= ~0.68, where all
+    gates are essentially open. Zero learned parameters.
+    """
+
+    def __init__(self, n_levels, n_features_per_level, gated_dim=None,
+                 c_max=0.6, width=0.1):
+        super().__init__()
+        self.F = n_features_per_level
+        self.width = float(width)
+        self.gated_dim = gated_dim if gated_dim is not None else n_levels * self.F
+        thresholds = (torch.linspace(0.0, float(c_max), n_levels)
+                      if n_levels > 1 else torch.zeros(1))
+        self.register_buffer("thresholds", thresholds)
+
+    def forward(self, emb, u):
+        """emb: (B, H, W, D) with the first gated_dim = L*F channels leveled
+        coarse->fine; u: (B,) signal fraction. Channels beyond gated_dim (e.g.
+        the static tail of hash_static) pass through ungated."""
+        g = torch.sigmoid((u.view(-1, 1) - self.thresholds) / self.width)  # (B, L)
+        g = g.repeat_interleave(self.F, dim=-1)                            # (B, L*F)
+        gated = emb[..., :self.gated_dim] * g.view(-1, 1, 1, self.gated_dim)
+        if emb.shape[-1] == self.gated_dim:
+            return gated
+        return torch.cat([gated, emb[..., self.gated_dim:]], dim=-1)
+
+
+def build_level_gate(cfg: dict):
+    """LevelGate from cfg['geo'] when level_gating is enabled (else None).
+
+    Only meaningful for leveled encoders (hash, healpix, hash_static — where
+    only the hash part is gated); other encoders reject the flag."""
+    g = cfg["geo"]
+    if not g.get("level_gating", False):
+        return None
+    encoder = g.get("encoder", "hash")
+    if encoder == "healpix":
+        n_levels = g.get("healpix_n_levels", g["n_levels"])
+    elif encoder in ("hash", "hash2d", "hash_static", "hash_compact",
+                     "hash_compact_static"):
+        n_levels = g["n_levels"]
+    else:
+        raise ValueError(f"level_gating requires a leveled encoder, got {encoder}")
+    return LevelGate(n_levels, g["n_features_per_level"],
+                     gated_dim=n_levels * g["n_features_per_level"],
+                     c_max=g.get("gating_c_max", 0.6),
+                     width=g.get("gating_width", 0.1))
+
+
+def checkpointed_embed(geo: nn.Module, coords):
+    """geo(coords), recomputing the encoder in backward instead of storing its
+    intermediates.
+
+    The pure-PyTorch hash/HEALPix lookup builds a chain of per-corner weight
+    and gather tensors (8 corners x L levels) that autograd would keep for
+    backward — ~2 GB at batch 24 on 128px patches. The gathers are
+    computationally trivial, so recomputing them costs milliseconds and the
+    math (and gradients) are identical. Parameter-free encoders (xyz,
+    sinusoidal, static) skip the machinery; so does any no-grad context."""
+    if torch.is_grad_enabled() and any(p.requires_grad for p in geo.parameters()):
+        return torch.utils.checkpoint.checkpoint(geo, coords, use_reentrant=False)
+    return geo(coords)
+
+
+class GeoConditionedUNet(nn.Module):
+    """Wrap a base UNet to consume a per-pixel geographic embedding.
+
+    The location embedding is encoded from static coordinates and concatenated
+    as extra input channels. The noise prediction stays single-channel (it only
+    predicts noise on the atmospheric field, never on the conditioning).
+    """
+
+    def __init__(self, base_unet: nn.Module, geo_encoder: MultiResHashGrid,
+                 level_gate: LevelGate | None = None,
+                 ddpm_timesteps: int | None = None):
+        super().__init__()
+        self.unet = base_unet
+        self.geo = geo_encoder
+        self.gate = level_gate
+        self.ddpm_timesteps = ddpm_timesteps
+
+    def forward(self, x_t, t, coords):
+        """x_t: (B,1,H,W); t: (B,) DDPM timesteps in [1, T] (or None for the
+        direct map, where gating is inert); coords: (B,H,W,d) in [0,1]."""
+        emb = checkpointed_embed(self.geo, coords)   # (B, H, W, E)
+        if self.gate is not None and t is not None and self.ddpm_timesteps:
+            u = 1.0 - t.float() / self.ddpm_timesteps   # signal fraction
+            emb = self.gate(emb, u.clamp(0.0, 1.0))
+        emb = emb.permute(0, 3, 1, 2).contiguous()   # (B, E, H, W)
+        return self.unet(torch.cat([x_t, emb], dim=1), t)
+
+
+def build_geo_encoder(cfg: dict, support=None):
+    """Dispatch on cfg['geo'].encoder.
+
+    Learned: 'hash' (default, Instant-NGP grid), 'healpix' (dense spherical
+    pyramid). Baselines: 'xyz' (raw coordinates), 'sinusoidal' (fixed Fourier
+    basis), 'static' (real physiographic fields)."""
+    g = cfg["geo"]
+    encoder = g.get("encoder", "hash")
+    if encoder == "healpix":
+        return HealpixGrid(
+            n_levels=g.get("healpix_n_levels", g["n_levels"]),
+            n_features_per_level=g["n_features_per_level"],
+            nside_min=g.get("healpix_nside_min", 1),
+            nside_max=g.get("healpix_nside_max", 128),
+        )
+    if encoder == "xyz":
+        return RawCoords(input_dim=g.get("input_dim", 3))
+    if encoder == "sinusoidal":
+        return SinusoidalSphere(input_dim=g.get("input_dim", 3),
+                                n_frequencies=g.get("sinusoidal_n_frequencies", 3))
+    if encoder == "static":
+        return StaticFields(n_fields=len(g.get("static_fields",
+                                               DEFAULT_STATIC_FIELDS)))
+    if encoder == "hash2d":
+        # 2-D plate-carree hash, angular-matched to the 3-D ladder: the 3-D
+        # grid's base cell is 2/16 rad = 7.2 deg of arc and its finest ~2/128
+        # rad = 0.9 deg; here 180 deg / 25 = 7.2 deg of latitude down to
+        # 180 / 200 = 0.9 deg, with the same growth factor (8^(1/7) = 1.346).
+        # Every level is dense at these sizes ((200+1)^2 < 2^19): ~178k params,
+        # no hash collisions, no unused volume axis — against the 3-D grid's
+        # 3.3M params of which ~16% are ever touched. Longitude cells are 2x
+        # coarser in degrees than latitude cells (360 vs 180 over the same
+        # unit range); the ~2/3 of latitude rows inside the +-60 deg patch
+        # band are the reachable ones.
+        return MultiResHashGrid(
+            input_dim=2,
+            n_levels=g["n_levels"],
+            n_features_per_level=g["n_features_per_level"],
+            log2_hashmap_size=g["log2_hashmap_size"],
+            base_resolution=g.get("hash2d_base_resolution", 25),
+            finest_resolution=g.get("hash2d_finest_resolution", 200),
+        )
+    if encoder in ("hash_compact", "hash_compact_static"):
+        # Support = every coordinate the dataset can ever query (the full band
+        # grid), so the touched-vertex enumeration is exact and no training or
+        # eval query can miss the compact table. Ported verbatim from
+        # claude/wb2-20var-downscaling 85f1ee6; see tests/test_hash_compact.py
+        # for the measured numbers on this config.
+        if support is None:
+            cf = np.load(Path(cfg["paths"]["patch_dir"]) / "coords_full.npz")
+            support = build_latlon_support(cf["lat"], cf["lon"],
+                                           altitude=g.get("altitude"))
+        grid = CompactMultiResHashGrid(
+            support=support,
+            input_dim=g.get("input_dim", 3), n_levels=g["n_levels"],
+            n_features_per_level=g["n_features_per_level"],
+            log2_hashmap_size=g["log2_hashmap_size"],
+            base_resolution=g["base_resolution"],
+            finest_resolution=g["finest_resolution"])
+        if encoder == "hash_compact_static":
+            # The discriminating arm: static fields supply physiography
+            # outright, so a gain over static-alone is location signal the
+            # tables hold BEYOND physiography, and parity says they were
+            # proxies for it. Motivated by the per-channel split in the paired
+            # 5-way eval — static leads the surface (t2m -26.3% vs -21.7%, msl
+            # -50.9% vs -43.1% against bicubic) while the compact grid leads
+            # z500 (-28.7% vs -27.8%). 16 learned + 3 static = 19 channels.
+            return HashStaticCombo(grid, n_fields=len(g.get("static_fields",
+                                                            DEFAULT_STATIC_FIELDS)))
+        return grid
+    _COMBO_BASE = {"xyz_static": "xyz", "sinusoidal_static": "sinusoidal"}
+    if encoder in _COMBO_BASE:
+        base_cfg = {**cfg, "geo": {**g, "encoder": _COMBO_BASE[encoder]}}
+        return EncoderStaticCombo(
+            build_geo_encoder(base_cfg), input_dim=g.get("input_dim", 3),
+            n_fields=len(g.get("static_fields", DEFAULT_STATIC_FIELDS)))
+    if encoder not in ("hash", "hash_static"):
+        raise ValueError(f"unknown geo encoder: {encoder}")
+    grid = MultiResHashGrid(
+        input_dim=g["input_dim"],
+        n_levels=g["n_levels"],
+        n_features_per_level=g["n_features_per_level"],
+        log2_hashmap_size=g["log2_hashmap_size"],
+        base_resolution=g["base_resolution"],
+        finest_resolution=g["finest_resolution"],
+    )
+    if encoder == "hash_static":
+        return HashStaticCombo(grid, n_fields=len(g.get("static_fields",
+                                                        DEFAULT_STATIC_FIELDS)))
+    return grid

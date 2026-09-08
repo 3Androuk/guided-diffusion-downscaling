@@ -1,0 +1,280 @@
+# 20-variable WB2 downscaling — 20 input and 20 output channels.
+# t2m is channel 0 and the display channel for figures/headline metrics.
+# All paths are separate from the single-variable runs so neither data nor
+# checkpoints can clobber each other.
+
+seed: 42
+
+paths:
+  raw_dir: datasets/raw_wb220
+  patch_dir: datasets/patches_wb220
+  ckpt_dir: checkpoints_wb220
+  results_dir: results_wb220
+  log_dir: results_wb220/tb
+
+data:
+  era5_zarr: "gs://weatherbench2/datasets/era5/1959-2022-6h-1440x721.zarr"
+  gcs_token: anon
+  name: wb220                    # short tag for wandb run names
+  # 20 channels: 5 surface + {z, t, u, v, q} at 500/700/850 hPa. Channel order
+  # here is the channel order everywhere (patches, model, stats, metrics).
+  variables:
+    - {name: 2m_temperature, level: null}
+    - {name: 10m_u_component_of_wind, level: null}
+    - {name: 10m_v_component_of_wind, level: null}
+    - {name: mean_sea_level_pressure, level: null}
+    - {name: total_column_water_vapour, level: null}
+    - {name: geopotential, level: 500}
+    - {name: geopotential, level: 700}
+    - {name: geopotential, level: 850}
+    - {name: temperature, level: 500}
+    - {name: temperature, level: 700}
+    - {name: temperature, level: 850}
+    - {name: u_component_of_wind, level: 500}
+    - {name: u_component_of_wind, level: 700}
+    - {name: u_component_of_wind, level: 850}
+    - {name: v_component_of_wind, level: 500}
+    - {name: v_component_of_wind, level: 700}
+    - {name: v_component_of_wind, level: 850}
+    - {name: specific_humidity, level: 500}
+    - {name: specific_humidity, level: 700}
+    - {name: specific_humidity, level: 850}
+  train_years: [2007, 2015]
+  test_years: [2016, 2017]
+  time_stride: 4                 # every 24h at a fixed hour (avoids diurnal aliasing)
+
+patches:
+  size: 128
+  per_field: 8                   # NOTE: 20-channel train patches are ~35 GB on
+                                 # disk at this setting; halve per_field to halve it.
+  lat_range: [-60.0, 60.0]
+
+normalize:
+  method: zscore                 # per-CHANNEL mean/std computed on train patches
+
+diffusion:
+  timesteps: 1000
+  beta_schedule: linear
+  beta_start: 1.0e-4
+  beta_end: 2.0e-2
+
+transport:
+  train_ratios: [2, 4, 8]
+  eval_ratios: [4, 8, 16]        # 16x is held out during training
+  time_scale: 1000.0
+  time_epsilon: 1.0e-4
+  sample_steps: 100
+  solver: heun
+  projection: final
+  stochastic_interpolant:
+    gamma: 0.5
+    score_weight: 1.0
+    sampler: ode
+    stochasticity: 0.1
+
+unet:
+  in_channels: 20                # one channel per data.variables entry
+  out_channels: 20
+  base_channels: 128             # widened for the 20-channel joint task (~4x the
+                                 # single-variable UNet's params; every level stays
+                                 # divisible by groupnorm_groups=32)
+  channel_mults: [1, 2, 4, 8]
+  num_res_blocks: 2
+  time_emb_dim: 256
+  attn_resolutions: [16]
+  dropout: 0.1
+  groupnorm_groups: 32
+
+geo:
+  enabled: false
+  # hash | healpix (learned) | xyz | sinusoidal | static (baselines — see t2m.yaml)
+  encoder: hash
+  sinusoidal_n_frequencies: 3
+  static_fields:
+    - geopotential_at_surface
+    - land_sea_mask
+    - slope_of_sub_gridscale_orography
+  # Ladder-MATCHED HEALPix: Nside 8,11,14,20,26,35,48,64 -> 7.33 deg (815 km)
+  # down to 0.92 deg (102 km), the same scale band and growth factor (b~1.35)
+  # as the hash grid's 16..128, at 218k dense params against the hash's 3.3M.
+  # nside_min is what makes it matched — WITHOUT it the default of 1 gives the
+  # power-of-two ladder 1,2,...,128, whose three coarsest levels (6520/3260/
+  # 1630 km) are at or above the 32 deg patch span and so are near-constant per
+  # patch, and whose finest (51 km, <2 ERA5 px) violates this file's own ~150 km
+  # cap. That misallocation is the diagnosed cause of the original HEALPix
+  # deficit, so leaving nside_min unset reproduces the known-bad result.
+  healpix_n_levels: 8
+  healpix_nside_min: 8
+  healpix_nside_max: 64
+  # Index file must be regenerated whenever the ladder changes, or the
+  # precomputed neighbours/weights and the tables disagree about resolutions:
+  #   python -m data.make_healpix_index --config config/wb2_20var.yaml
+  healpix_index: healpix_index_matched.npz
+  input_dim: 3
+  n_levels: 8
+  n_features_per_level: 2
+  log2_hashmap_size: 19
+  base_resolution: 16
+  finest_resolution: 128
+  altitude: null
+  # 2-D hash arm (--encoder hash2d): plate-carree (lat, lon) instead of
+  # unit-sphere xyz, testing whether the 3-D grid's wasted volume axis (84% of
+  # entries never touched, ~537k effective of 3.3M params) is what a fair 2-D
+  # parameterization fixes. Ladder is angular-matched to base/finest above:
+  # the 3-D base cell is 2/16 rad = 7.2 deg of arc -> 180/25 = 7.2 deg of
+  # latitude; finest 2/128 rad ~ 0.9 deg -> 180/200 = 0.9 deg; growth factor
+  # 8^(1/7) = 1.346 in both. All 8 levels dense ((200+1)^2 < 2^19): ~178k
+  # params, zero hash collisions. Trade-offs accepted by design: a coordinate
+  # seam at the prime meridian (never inside a patch) and lon cells 2x coarser
+  # in degrees than lat cells. Checkpoint tag: _geo_hash2d.
+  hash2d_base_resolution: 25
+  hash2d_finest_resolution: 200
+  # Noise-dependent level gating (--gated): multiply embedding level l by
+  # sigmoid((u - c_l) / width) where u is the signal fraction (DDPM: 1 - t/T;
+  # transport: t) and c_l = l/(L-1) * c_max — fine levels fade out at high
+  # noise so early denoising can't lean on (memorize) fine-scale features.
+  # Zero parameters; applies to leveled encoders (hash, healpix, hash_static —
+  # static tail stays ungated). Checkpoint suffix gains "_gated".
+  level_gating: false
+  gating_c_max: 0.6                # threshold of the finest level (coarsest = 0)
+  gating_width: 0.1                # sigmoid softness
+
+residual:
+  train_ratios: [2, 4, 8]
+  n_steps: 100
+
+train:
+  # LADDER CONSTANT for ALL 20-var arms on BriCS: global batch 128 = 32 per
+  # process x 4 GH200s. batch_size is PER PROCESS under torchrun, so the binding
+  # quantity is the GLOBAL batch — the same 32 on one GPU is global 32, a
+  # different experiment. Every arm must use 32 AND 4 GPUs or the comparison is
+  # confounded by batch, which changes optimizer steps per epoch and gradient
+  # noise, hence converged quality.
+  #
+  # Measured on a 96 GB GH200 (scripts/bench_batch.py, flow+geo, bf16): batch 32
+  # = 24.9 GiB and 139 samp/s; 96 = 68 GiB and 163 samp/s. The extra 17% is not
+  # worth it — 96 would make the global batch 384 against the 80 this lr was
+  # tuned at, and 2e-4 already collapsed this model. 32 keeps ~200 epochs near
+  # 3 h on one node, inside the 24 h walltime.
+  #
+  # SELF-CONTAINED STUDY. These runs are NOT comparable with the RTX 3090 runs
+  # (single GPU, batch 20 -> global batch 20, fp32) and must not be pooled with
+  # them: global 128 vs 20 is 6.4x fewer optimizer steps per epoch at the same
+  # lr, and bf16 vs fp32 is a second independent difference. Either study is
+  # internally valid; mixing them is the only wrong answer. Report separately.
+  #
+  # The previous constant was 20, set by a 24 GB card that no longer applies;
+  # no 20-var checkpoints existed on BriCS when it changed.
+  batch_size: 32
+  epochs: 200
+  lr: 1.0e-4                     # 2e-4 (the width-64 value) collapses the width-128
+                                 # model to the trivial loss=1 solution by epoch ~2;
+                                 # halved with the standard width scaling
+  weight_decay: 0.0
+  grad_clip: 1.0
+  amp: false
+  # off | fp16 | bf16 (CLI: --amp-dtype). Part of the ladder constant: bf16 for
+  # every arm. Measured +51% throughput over fp32 at matched batch (182.9 vs
+  # 121.0 samp/s) with LESS memory, and unlike a bigger batch it does not touch
+  # the optimization regime. Legacy `amp: true` above still means fp16.
+  amp_dtype: bf16
+  ema_decay: 0.999
+  num_workers: 4
+  log_every: 50
+  val_patches: 256
+  ckpt_every_epochs: 1
+  sample_every_epochs: 10
+  # Stop a run whose val loss has blown up and is not recovering. The 20-var
+  # no-geo baseline (job 6169725) trained healthily to epoch 89 (val 0.01261),
+  # collapsed to the trivial solution by 92 (0.99980), then ran 108 more epochs
+  # at full cost for a worthless checkpoint. patience>1 is essential: the same
+  # run spiked 6.4x at epoch 10 and recovered, so a single-epoch trigger would
+  # kill healthy runs.
+  divergence:
+    enabled: true
+    factor: 10.0                 # abort above this multiple of the best val loss
+    patience: 3                  # ... for this many CONSECUTIVE epochs
+    min_epochs: 5                # before this, "best so far" is not meaningful
+    # On trigger, reload <stem>_best.pt (weights, EMA and Adam moments)
+    # and carry on with a reshuffled data order instead of ending the run.
+    # Independent of the spike guard and of whether the diagnosis is
+    # right: whatever the mechanism, the state from before the collapse is
+    # a healthy run in progress, and every epoch after one is wasted
+    # anyway because the trivial solution is absorbing. Bounded so an
+    # unlearnable setup cannot loop forever on billed nodes. 0 = the old
+    # stop-and-exit behaviour, which is what the completed arms ran under
+    # (neither ever triggered, so the change cannot affect them).
+    rollbacks: 8
+  # Skip the optimizer step on a pathological gradient, so the collapse the
+  # divergence guard detects does not happen in the first place. The no-geo arm
+  # collapsed twice from different RNG states (job 6169725 epoch 92, job 6189791
+  # epoch 82) while both geo arms ran 200 epochs clean; grad_clip does not
+  # prevent it because Adam normalizes the step by its own second moment, so
+  # clipping changes the direction's weight, not the distance travelled.
+  #
+  # PREDATES THE COMPLETED ARMS (6160937 hpx, 6169727 static), which trained
+  # without it. That does not break the shared recipe: the guard only acts when
+  # it fires, and their whole-run maximum gradient norms — 0.374 and 1.578 —
+  # are far under this threshold (50x a running median of ~0.10 = ~5.0), so
+  # enabling it would have been a no-op for both. tests/test_spike_guard.py
+  # asserts exactly that against their observed traces.
+  #
+  # 50x is chosen because the gap is empty, not because it is tuned: the largest
+  # gradient any healthy run produced is 1.578 and the smallest step consistent
+  # with either collapse window is ~130. Two orders of magnitude separate them.
+  spike:
+    enabled: true
+    factor: 50.0                 # skip above this multiple of the running median
+    window: 200                  # ... of the last N accepted steps
+    warmup: 200                  # unarmed until the history is this long
+    max_consecutive: 20          # beyond this it is a stall, not a spike
+
+directmap:
+  train_ratio: 4
+  # Matches train.batch_size: the ladder constant binds EVERY arm, including the
+  # regression mean. Left at 20 it would be the one arm confounded by batch.
+  batch_size: 32
+  epochs: 200
+  lr: 5.0e-5                     # HALVED for the mean map only.
+  # At 1e-4 it exploded 80 times in 56 epochs (grad ~10.7 vs a p99 of
+  # 0.177 -- 88x, so real spikes, not ratio-randomization artefacts),
+  # collapsed 4x and exhausted its rollbacks at epoch 56 of 200. The
+  # regression predicts the FIELD with an unbounded loss, unlike the
+  # diffusion arms predicting unit-variance noise, and --random-ratio
+  # makes it fit 2x/4x/8x at once.
+                                 # model to the trivial loss=1 solution by epoch ~2;
+                                 # halved with the standard width scaling
+  grad_clip: 1.0
+  amp: false
+  amp_dtype: bf16                # ladder constant — same precision as every arm
+
+sample:
+  ddim_eta: 0.0
+  guidance_strength: 0.0
+  interp: nearest
+  reconstructions:
+    - ratio: 4
+      K: 3
+      t_steps: [160, 114, 80]
+      smooth_sigma: 0.0
+    - ratio: 8
+      K: 1
+      t_steps: [320]
+      smooth_sigma: 5.0
+
+eval:
+  # 1024, spread across all 731 test fields by eval.compare_geo.test_indices.
+  # The old 256 were the FIRST 256 patches = ~32 consecutive January days, so
+  # the scores rested on ~32 independent weather states. linspace fixed the
+  # coverage for free; this widens the sample on top of it. Eval cost is linear
+  # in this number (~40 min per 5 arms at 256 on one GPU).
+  n_test_patches: 1024
+  display_channel: 0             # t2m: figures + headline physical-unit metrics
+  spectrum_bins: null
+  hist_bins: 100
+
+wandb:
+  enabled: false
+  project: era5-diffusion-downscaling
+  entity: null
+  name: null

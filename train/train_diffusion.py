@@ -1,0 +1,525 @@
+"""Train the DDPM noise predictor on high-fidelity Z500 patches only.
+
+The diffusion model never sees low-fidelity data during training — this is what
+gives the inference-time distribution robustness across downsampling ratios.
+
+Run:
+    python -m train.train_diffusion --config config/default.yaml
+
+Optionally, the same run can be split across several GPUs/nodes (e.g. 4 nodes)
+by launching under torchrun — see train/distributed.py and
+scripts/train_multinode.sh. Single-process behavior is unchanged.
+"""
+
+import argparse
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, Subset
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from data.dataset import PatchDataset, load_norm_stats  # noqa: E402
+from eval.metrics import spectrum_log_l1  # noqa: E402
+from models.diffusion import build_diffusion  # noqa: E402
+from models.unet import build_unet  # noqa: E402
+from train.distributed import (barrier, broadcast_flag, cleanup,  # noqa: E402
+                               init_distributed,
+                               make_train_loader, set_epoch, wrap_model)
+from train.ema import EMA  # noqa: E402
+from utils import (add_perf_args, apply_perf_overrides,  # noqa: E402
+                   build_divergence_guard, build_spike_guard, resolve_amp,
+                   channel_labels, display_channel, ensure_dir, geo_suffix,
+                   init_wandb, load_config, run_name, set_seed)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default="config/default.yaml")
+    ap.add_argument("--wandb", action="store_true",
+                    help="Enable wandb logging (overrides config wandb.enabled).")
+    ap.add_argument("--resume", action="store_true",
+                    help="Resume from paths.ckpt_dir/diffusion.pt if it exists.")
+    ap.add_argument("--geo", action="store_true",
+                    help="Force geo.enabled: true (overrides config), so baseline "
+                         "and geo runs can be chained without editing the config.")
+    ap.add_argument("--seed", type=int, default=None,
+                    help="Override config seed for replicate runs; the checkpoint "
+                         "name gets an _s<seed> suffix so replicates don't "
+                         "overwrite the primary run.")
+    ap.add_argument("--encoder", choices=["hash", "hash2d", "hash_compact", "healpix", "xyz", "sinusoidal", "static", "hash_static", "hash_compact_static", "xyz_static", "sinusoidal_static"], default=None,
+                    help="Override geo.encoder from the CLI so the config can "
+                         "keep its default.")
+    ap.add_argument("--gated", action="store_true",
+                    help="Force geo.level_gating: true — noise-dependent gating "
+                         "of the embedding levels (fine levels fade out at high "
+                         "noise); checkpoint gains a _gated suffix.")
+    add_perf_args(ap)
+    args = ap.parse_args()
+    cfg = load_config(args.config)
+    if args.wandb:
+        cfg.setdefault("wandb", {})["enabled"] = True
+    if args.geo:
+        cfg.setdefault("geo", {})["enabled"] = True
+    if args.encoder is not None:
+        cfg.setdefault("geo", {})["encoder"] = args.encoder
+    if args.gated:
+        cfg.setdefault("geo", {})["level_gating"] = True
+    if args.seed is not None:
+        cfg["seed"] = args.seed
+    apply_perf_overrides(cfg, args, "train")
+    set_seed(cfg["seed"])
+    dist = init_distributed()  # no-op unless launched under torchrun
+    device = dist.device
+
+    tc = cfg["train"]
+    patch_dir = Path(cfg["paths"]["patch_dir"])
+    ckpt_dir = ensure_dir(cfg["paths"]["ckpt_dir"])
+    results_dir = ensure_dir(cfg["paths"]["results_dir"])
+
+    geo_on = cfg.get("geo", {}).get("enabled", False)
+    seed_suffix = f"_s{cfg['seed']}" if args.seed is not None else ""
+    ckpt_name = f"diffusion{geo_suffix(cfg)}{seed_suffix}.pt"
+
+    normalizer = load_norm_stats(patch_dir)
+    if geo_on:
+        gcfg = cfg["geo"]
+        ds = PatchDataset(
+            patch_dir / "train_patches.npy", normalizer,
+            origins_path=patch_dir / "train_origins.npy",
+            coords_full_path=patch_dir / "coords_full.npz",
+            geo_input_dim=gcfg["input_dim"], altitude=gcfg["altitude"],
+            geo_encoder=gcfg.get("encoder", "hash"),
+            healpix_index_path=((patch_dir / gcfg["healpix_index"])
+                                if gcfg.get("healpix_index") else None),
+        )
+    else:
+        ds = PatchDataset(patch_dir / "train_patches.npy", normalizer)
+    loader = make_train_loader(ds, tc["batch_size"], tc["num_workers"], dist,
+                               seed=cfg["seed"])
+    print(f"Train patches: {len(ds)} | batches/epoch: {len(loader)} | geo={geo_on}")
+
+    # Reference patches (physical units) for the periodic sample-spectrum metric.
+    _spec_ref = None
+    if dist.is_main:
+        _spec_ref = normalizer.decode(torch.stack(
+            [ds[i][0] if geo_on else ds[i] for i in range(min(64, len(ds)))]))
+
+    # Held-out patches for a fixed-RNG validation loss (comparable across
+    # epochs). Rank 0 only under DDP: weights are identical on every rank, so
+    # one process scoring the full val set reproduces single-process values.
+    val_loader = None
+    test_path = patch_dir / "test_patches.npy"
+    if dist.is_main and test_path.exists():
+        if geo_on:
+            gcfg = cfg["geo"]
+            val_ds = PatchDataset(
+                test_path, normalizer,
+                origins_path=patch_dir / "test_origins.npy",
+                coords_full_path=patch_dir / "coords_full.npz",
+                geo_input_dim=gcfg["input_dim"], altitude=gcfg["altitude"],
+                geo_encoder=gcfg.get("encoder", "hash"),
+            healpix_index_path=((patch_dir / gcfg["healpix_index"])
+                                if gcfg.get("healpix_index") else None),
+            )
+        else:
+            val_ds = PatchDataset(test_path, normalizer)
+        n_val = min(int(tc.get("val_patches", 256)), len(val_ds))
+        # Spread over the WHOLE test split. Patches are time-ordered at 8 per
+        # field, so range(n_val) took the first n_val/8 fields — at 256 that is
+        # ~32 consecutive days of January out of two years. Gradients never see
+        # val, so this never affected the learned weights; it did make the
+        # best-checkpoint choice and the reported val loss winter-only.
+        # linspace costs exactly the same per epoch.
+        val_idx = np.linspace(0, len(val_ds) - 1, n_val).astype(int).tolist()
+        val_loader = DataLoader(Subset(val_ds, val_idx),
+                                batch_size=tc["batch_size"], shuffle=False, num_workers=0)
+        print(f"Val patches: {n_val}")
+    elif dist.is_main:
+        print("(no test_patches.npy — skipping val loss)")
+
+    if geo_on:
+        from models.geo_encoding import (GeoConditionedUNet, build_geo_encoder,
+                                         build_level_gate)
+        geo_enc = build_geo_encoder(cfg)
+        base = build_unet(cfg, use_time=True, extra_in_channels=geo_enc.output_dim)
+        model = GeoConditionedUNet(base, geo_enc, level_gate=build_level_gate(cfg),
+                                   ddpm_timesteps=cfg["diffusion"]["timesteps"]).to(device)
+    else:
+        model = build_unet(cfg, use_time=True).to(device)
+    diffusion = build_diffusion(cfg).to(device)
+    ema = EMA(model, decay=tc["ema_decay"])
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"UNet params: {n_params:,}")
+
+    opt = torch.optim.AdamW(model.parameters(), lr=tc["lr"], weight_decay=tc["weight_decay"])
+    guard = build_divergence_guard(tc)
+    spike = build_spike_guard(tc)
+    # Rollback budget: on divergence, reload the best checkpoint and carry on
+    # rather than ending the run. Bounded so a genuinely unlearnable setup
+    # cannot loop forever burning node-hours.
+    rollbacks_left = int(tc.get('divergence', {}).get('rollbacks', 0))
+    reshuffle_offset = 0
+    best_val = float("inf")
+    use_amp, amp_dtype = resolve_amp(tc, device.type)
+    # A GradScaler exists for fp16's narrow exponent range; bf16 needs none.
+    scaler = torch.amp.GradScaler(
+        "cuda", enabled=use_amp and amp_dtype is torch.float16)
+
+    start_epoch, step = 1, 0
+    ckpt_path = ckpt_dir / ckpt_name
+    # Best-by-validation, kept beside the rolling checkpoint (see the save block).
+    best_ckpt_path = ckpt_path.with_name(f"{ckpt_path.stem}_best{ckpt_path.suffix}")
+    if args.resume and ckpt_path.exists():
+        ck = torch.load(ckpt_path, map_location=device, weights_only=False)
+        model.load_state_dict(ck["model"])
+        ema.load_state_dict(ck["ema"])
+        if "opt" in ck:  # checkpoints from before resume support lack these
+            opt.load_state_dict(ck["opt"])
+            scaler.load_state_dict(ck["scaler"])
+        else:
+            print("(old checkpoint: no optimizer/scaler state — resuming weights only)")
+        if not (_weights_finite(model) and _weights_finite(ema.shadow)):
+            raise RuntimeError(
+                f"{ckpt_path} contains non-finite weights (training had diverged "
+                "before it was saved). Delete or move it and start fresh.")
+        start_epoch = ck["epoch"] + 1
+        step = ck["step"]
+        print(f"Resumed from {ckpt_path} at epoch {ck['epoch']} (step {step})")
+    elif args.resume:
+        print(f"(no checkpoint at {ckpt_path} — starting fresh)")
+
+    # DDP wrap AFTER resume so state loads into the raw module; raw_model stays
+    # the handle for EMA/val/checkpointing (its state_dict keeps plain keys).
+    raw_model = model
+    model = wrap_model(model, dist, cfg)
+    if dist.enabled:
+        # Same weights everywhere (DDP broadcast), different noise/timestep
+        # draws per rank — otherwise all ranks would sample identical batch noise.
+        set_seed(cfg["seed"] + dist.rank)
+
+    writer = None
+    if dist.is_main:
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+            writer = SummaryWriter(cfg["paths"]["log_dir"])
+        except Exception:
+            print("(tensorboard unavailable — skipping logging)")
+
+    wb_run, wandb = (None, None)
+    if dist.is_main:
+        wb_run, wandb = init_wandb(cfg, job_type="train_diffusion",
+                                   extra_config={"unet_params": n_params,
+                                                 "n_train_patches": len(ds),
+                                                 "world_size": dist.world_size},
+                                   name=run_name(cfg, Path(ckpt_name).stem,
+                                                 "resumed" if start_epoch > 1 else ""))
+    if wb_run is not None:
+        print(f"wandb: logging to {wb_run.url}")
+
+    # Accumulators persist across epoch boundaries: batches/epoch is rarely
+    # a multiple of log_every, and resetting per epoch both drops the tail
+    # batches and makes the next log divide a partial sum by the full window.
+    running, running_n, grad_sum = 0.0, 0, 0.0
+    bucket_sum, bucket_n = [0.0] * 4, [0] * 4  # loss by timestep quartile
+    t_last_log = time.time()
+    for epoch in range(start_epoch, tc["epochs"] + 1):
+        # The offset makes a post-rollback replay of the same epoch numbers
+        # draw a DIFFERENT shard order — without it the retry is deterministic
+        # and reproduces the collapse it is retrying (observed on job 6189455).
+        set_epoch(loader, epoch + 10_000 * reshuffle_offset)
+        model.train()
+        epoch_loss, epoch_batches = 0.0, 0
+        epoch_start = time.time()
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats()
+        for batch in loader:
+            if geo_on:
+                x0, coords = batch
+                x0 = x0.to(device, non_blocking=True)
+                coords = coords.to(device, non_blocking=True)
+            else:
+                x0, coords = batch.to(device, non_blocking=True), None
+            opt.zero_grad(set_to_none=True)
+            with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
+                loss, per_sample, t = diffusion.training_loss(
+                    model, x0, cond=coords, return_details=True)
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                tc["grad_clip"] if tc["grad_clip"] > 0 else float("inf"))
+            # clip_grad_norm_ returns the norm BEFORE clipping, which is what
+            # the spike guard needs — after clipping every step looks identical.
+            if spike is not None and spike.check(float(grad_norm)):
+                # Skip the step entirely: no opt.step(), so Adam's moments never
+                # see the bad direction, and no ema.update(), so EMA keeps the
+                # pre-spike weights. Gradients are all-reduced by DDP, so every
+                # rank took this same branch — no collective needed to agree.
+                if dist.is_main and spike.skipped <= 20:
+                    print(f"  spike guard: skipped step {step} — {spike.last_reason}")
+                if spike.exhausted() and dist.is_main:
+                    print(f"  spike guard: {spike.consecutive} consecutive skips — "
+                          "the run is stalled, not spiking; leaving it to the "
+                          "divergence guard")
+                # Required even though we skipped scaler.step(): update() ends
+                # the scaler's per-optimizer cycle, and without it the next
+                # unscale_() raises "unscale_() has already been called". No-op
+                # under bf16 (the scaler is disabled), but fp16 is still a
+                # supported amp_dtype.
+                scaler.update()
+                step += 1
+                continue
+            scaler.step(opt)
+            scaler.update()
+            ema.update(raw_model)
+
+            running += loss.item()
+            running_n += 1
+            grad_sum += grad_norm.item()
+            epoch_loss += loss.item()
+            epoch_batches += 1
+            q = ((t - 1) * 4 // diffusion.timesteps).clamp(max=3)
+            for k in range(4):
+                sel = q == k
+                if sel.any():
+                    bucket_sum[k] += per_sample[sel].sum().item()
+                    bucket_n[k] += int(sel.sum())
+            step += 1
+            if step % tc["log_every"] == 0:
+                now = time.time()
+                metrics = {
+                    "train/loss": running / running_n,
+                    "train/grad_norm": grad_sum / running_n,
+                    # Global throughput: all ranks step in lockstep, so rank
+                    # 0's window x world_size counts every rank's images.
+                    "train/imgs_per_sec": (running_n * x0.shape[0] * dist.world_size
+                                           / (now - t_last_log)),
+                    "epoch": epoch,
+                }
+                for k in range(4):  # q1 = lowest-noise quartile of t
+                    if bucket_n[k]:
+                        metrics[f"train/loss_t_q{k + 1}"] = bucket_sum[k] / bucket_n[k]
+                if use_amp and amp_dtype is torch.float16:
+                    metrics["train/amp_scale"] = scaler.get_scale()
+                print(f"epoch {epoch:03d} step {step:07d} | "
+                      f"loss {metrics['train/loss']:.5f} | "
+                      f"grad {metrics['train/grad_norm']:.3f} | "
+                      f"{metrics['train/imgs_per_sec']:.1f} img/s")
+                if writer:
+                    for k_, v_ in metrics.items():
+                        writer.add_scalar(k_, v_, step)
+                if wb_run is not None:
+                    wb_run.log(metrics, step=step)
+                running, running_n, grad_sum = 0.0, 0, 0.0
+                bucket_sum, bucket_n = [0.0] * 4, [0] * 4
+                t_last_log = now
+
+        epoch_metrics = {
+            "train/epoch_loss": epoch_loss / max(epoch_batches, 1),
+            "train/epoch_time_s": time.time() - epoch_start,
+            "epoch": epoch,
+        }
+        if device.type == "cuda":
+            epoch_metrics["train/gpu_mem_gb"] = torch.cuda.max_memory_allocated() / 2**30
+        if val_loader is not None:
+            epoch_metrics["val/loss"] = _val_loss(diffusion, raw_model, val_loader, device)
+            epoch_metrics["val/loss_ema"] = _val_loss(diffusion, ema.shadow, val_loader, device)
+            print(f"epoch {epoch:03d} done | val loss {epoch_metrics['val/loss']:.5f} "
+                  f"(ema {epoch_metrics['val/loss_ema']:.5f}) | "
+                  f"{epoch_metrics['train/epoch_time_s']:.0f}s")
+        if writer:
+            for k_, v_ in epoch_metrics.items():
+                writer.add_scalar(k_, v_, step)
+        if wb_run is not None:
+            wb_run.log(epoch_metrics, step=step)
+        # Divergence guard. Only rank 0 has a val loss, so its verdict must be
+        # broadcast — breaking out on one rank alone would hang the rest.
+        reason = None
+        if guard is not None and "val/loss" in epoch_metrics:
+            reason = guard.update(epoch_metrics["val/loss"], epoch)
+        if guard is not None and broadcast_flag(reason is not None, dist):
+            # Rolling back beats stopping when a good checkpoint exists: the
+            # collapse is absorbing, so every epoch after it is wasted, but the
+            # weights from before it are still a healthy run in progress. This
+            # is the second line of defence behind SpikeGuard, and it does not
+            # depend on having diagnosed the cause correctly — whatever the
+            # mechanism, the state from `rollbacks_left` epochs ago is fine.
+            if rollbacks_left > 0 and best_ckpt_path.exists():
+                rollbacks_left -= 1
+                reshuffle_offset += 1
+                if dist.is_main:
+                    print(f"DIVERGED at epoch {epoch}: {reason}\n"
+                          f"  rolling back to {best_ckpt_path} (val {best_val:.5f}) "
+                          f"and continuing with a reshuffled data order; "
+                          f"{rollbacks_left} rollback(s) left after this one.",
+                          flush=True)
+                # Rank 0 wrote the file; make sure that write has landed before
+                # any rank reads it, or a late rank loads a torn checkpoint.
+                barrier(dist)
+                ck = torch.load(best_ckpt_path, map_location=device,
+                                weights_only=False)
+                raw_model.load_state_dict(ck["model"])
+                ema.load_state_dict(ck["ema"])
+                # Adam's moments must come back too. Keeping the diverged ones
+                # would re-apply the bad direction for the next ~1/(1-beta2)
+                # steps and walk straight back into the same basin.
+                opt.load_state_dict(ck["opt"])
+                scaler.load_state_dict(ck["scaler"])
+                # Different noise/timestep draws AND a different shard order, so
+                # the replay is not deterministic — resuming job 6189455 with an
+                # identical order reproduced the earlier collapse epoch for
+                # epoch. reshuffle_offset feeds set_epoch below.
+                set_seed(cfg["seed"] + dist.rank + 1000 * reshuffle_offset)
+                guard = build_divergence_guard(tc)   # fresh strikes and best
+                if spike is not None:
+                    spike = build_spike_guard(tc)    # history is stale post-rollback
+                continue
+            if dist.is_main:
+                print(f"DIVERGED at epoch {epoch}: {reason}\n"
+                      f"Stopping early. The rolling checkpoint holds the diverged "
+                      f"weights, but the pre-collapse state survives at "
+                      f"{best_ckpt_path} (val {best_val:.5f}) — evaluate or resume "
+                      f"from that, not from {ckpt_path}.",
+                      flush=True)
+            break
+
+        t_last_log = time.time()  # exclude val/sampling time from throughput
+
+        if dist.is_main and epoch % tc["sample_every_epochs"] == 0:
+            sample_path = results_dir / f"uncond_epoch{epoch:03d}.png"
+            sample_cond = None
+            if geo_on:
+                # The geo model always needs coords; sample at 4 FIXED locations
+                # (first training patches) so the learned location prior is
+                # comparable across epochs.
+                sample_cond = torch.stack([ds[i][1] for i in range(4)]).to(device)
+            samples_phys = _save_samples(diffusion, ema.shadow, normalizer, device,
+                                         sample_path, cfg, cond=sample_cond)
+            # Spectral distance of the samples to real patches: MSE-type losses
+            # are nearly blind to spectral defects (speckle = excess high-k
+            # energy), so track it explicitly across training.
+            if _spec_ref is not None:
+                disp = display_channel(cfg)
+                spec_err = spectrum_log_l1(samples_phys[:, disp:disp + 1],
+                                           _spec_ref[:, disp:disp + 1])
+                print(f"  samples spectrum_log_l1 vs train patches: {spec_err:.4f}")
+                if writer:
+                    writer.add_scalar("samples/spectrum_log_l1", spec_err, step)
+                if wb_run is not None:
+                    wb_run.log({"samples/spectrum_log_l1": spec_err}, step=step)
+            if wb_run is not None:
+                wb_run.log({"samples": wandb.Image(str(sample_path))}, step=step)
+        if epoch % tc["ckpt_every_epochs"] == 0 or epoch == tc["epochs"]:
+            # Never clobber the last good checkpoint with diverged weights; a
+            # NaN here is unrecoverable, so stop instead of training garbage.
+            # (All ranks check — weights are identical, so all stop together.)
+            if not (_weights_finite(raw_model) and _weights_finite(ema.shadow)):
+                raise RuntimeError(
+                    f"non-finite weights at epoch {epoch} — training has diverged. "
+                    f"Checkpoint NOT overwritten; last good state kept at {ckpt_path}. "
+                    "Fix the cause (e.g. disable amp), then rerun with --resume.")
+            if dist.is_main:
+                _save_ckpt(ckpt_path, raw_model, ema, opt, scaler, cfg,
+                           normalizer, epoch, step)
+                # ... and keep the BEST-so-far separately. The rolling checkpoint
+                # above is overwritten every epoch, so a late collapse destroys
+                # every good weight that preceded it: the 20-var baseline was at
+                # val 0.01261 on epoch 89, collapsed on 92, and overwrote that
+                # state 109 more times. The _weights_finite check above does not
+                # help — those weights were finite, merely degenerate at loss 1.0.
+                v = epoch_metrics.get("val/loss")
+                if v is not None and v < best_val:
+                    best_val = v
+                    _save_ckpt(best_ckpt_path, raw_model, ema, opt, scaler, cfg,
+                               normalizer, epoch, step)
+
+    if wb_run is not None:
+        wb_run.finish()
+    cleanup(dist)
+    print(f"Done. Checkpoint -> {ckpt_path}")
+    if best_val < float("inf"):
+        print(f"Best (val {best_val:.5f}) -> {best_ckpt_path}")
+
+
+@torch.no_grad()
+def _weights_finite(model) -> bool:
+    return all(p.isfinite().all() for p in model.parameters())
+
+
+@torch.no_grad()
+def _val_loss(diffusion, model, val_loader, device):
+    """Noise-prediction loss on held-out patches under a fixed RNG, so every
+    epoch scores the same (timestep, noise) draws and values are comparable."""
+    was_training = model.training
+    model.eval()
+    total, n = 0.0, 0
+    devices = [device] if device.type == "cuda" else []
+    with torch.random.fork_rng(devices=devices):
+        torch.manual_seed(0)
+        if device.type == "cuda":
+            torch.cuda.manual_seed_all(0)
+        for batch in val_loader:
+            if isinstance(batch, (list, tuple)):
+                x0, coords = batch
+                x0 = x0.to(device, non_blocking=True)
+                coords = coords.to(device, non_blocking=True)
+            else:
+                x0, coords = batch.to(device, non_blocking=True), None
+            loss = diffusion.training_loss(model, x0, cond=coords)
+            total += loss.item() * x0.shape[0]
+            n += x0.shape[0]
+    if was_training:
+        model.train()
+    return total / max(n, 1)
+
+
+def _save_ckpt(path, model, ema, opt, scaler, cfg, normalizer, epoch, step):
+    # Write via a .tmp then rename: this path overwrites the previous checkpoint
+    # every ckpt_every_epochs, and an interrupted torch.save would otherwise
+    # corrupt the only copy.
+    tmp = path.with_suffix(".pt.tmp")
+    torch.save({
+        "model": model.state_dict(),
+        "ema": ema.state_dict(),
+        "opt": opt.state_dict(),
+        "scaler": scaler.state_dict(),
+        "config": cfg,
+        "norm_mean": normalizer.mean,
+        "norm_std": normalizer.std,
+        "epoch": epoch,
+        "step": step,
+    }, tmp)
+    tmp.replace(path)
+
+
+@torch.no_grad()
+def _save_samples(diffusion, model, normalizer, device, path, cfg, cond=None):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    size = cfg["patches"]["size"]
+    channels = cfg["unet"]["out_channels"]
+    disp = display_channel(cfg)
+    disp_label = channel_labels(cfg["data"])[disp]
+    samples = diffusion.sample_unconditional(model, (4, channels, size, size), device,
+                                             n_steps=100, cond=cond)
+    samples = normalizer.decode(samples.cpu()).numpy()
+    fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+    for ax, s in zip(axes, samples):
+        ax.imshow(s[disp], cmap="RdBu_r")
+        ax.axis("off")
+    mode = "Geo-conditioned (fixed locations)" if cond is not None else "Unconditional"
+    fig.suptitle(f"{mode} diffusion samples ({disp_label})")
+    fig.tight_layout()
+    fig.savefig(path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  saved samples -> {path}")
+    return samples
+
+
+if __name__ == "__main__":
+    main()

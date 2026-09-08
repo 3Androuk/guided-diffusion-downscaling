@@ -1,0 +1,136 @@
+"""Patch dataset + normalization helpers.
+
+The diffusion model trains on z-score-normalized high-fidelity patches only.
+Low-fidelity inputs are generated on the fly (see data.degrade) and are never
+part of the diffusion training set.
+"""
+
+import sys
+from pathlib import Path
+
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+
+class Normalizer:
+    """Per-channel z-score normalization (in physical units).
+
+    mean/std are stored as (C, 1, 1) tensors that broadcast over
+    (..., C, H, W); a scalar (legacy single-channel stats) becomes C=1 and
+    broadcasts over any channel count exactly as before.
+    """
+
+    def __init__(self, mean, std):
+        mean = np.asarray(mean, dtype=np.float32).reshape(-1)
+        std = np.asarray(std, dtype=np.float32).reshape(-1)
+        std = np.where(std > 1e-8, std, 1.0)
+        self.mean = torch.from_numpy(mean).view(-1, 1, 1)
+        self.std = torch.from_numpy(std).view(-1, 1, 1)
+
+    def _stats(self, x: torch.Tensor):
+        return (self.mean.to(device=x.device, dtype=x.dtype),
+                self.std.to(device=x.device, dtype=x.dtype))
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        mean, std = self._stats(x)
+        return (x - mean) / std
+
+    def decode(self, x: torch.Tensor) -> torch.Tensor:
+        mean, std = self._stats(x)
+        return x * std + mean
+
+    @classmethod
+    def from_npz(cls, path: str | Path) -> "Normalizer":
+        d = np.load(path)
+        return cls(d["mean"], d["std"])
+
+
+def load_norm_stats(patch_dir: str | Path) -> Normalizer:
+    return Normalizer.from_npz(Path(patch_dir) / "norm_stats.npz")
+
+
+class PatchDataset(Dataset):
+    """High-fidelity patches, returned z-score normalized as (C, H, W) tensors.
+
+    If `origins_path` and `coords_full_path` are given, each item is instead a
+    tuple (patch, geo_payload) used for geo-conditioning. The payload depends
+    on `geo_encoder`:
+      - "hash" (default): per-pixel normalized coordinates (H, W, d), consumed
+        by MultiResHashGrid. "hash2d" is the same payload with d forced to 2
+        (plate-carree lat/lon instead of unit-sphere xyz).
+      - "healpix": the per-patch crop of the precomputed interpolation table
+        (see data/make_healpix_index.py), packed as one float32 tensor
+        (L, H, W, 8) = [4 neighbor cell indices | 4 weights] so that default
+        collate, .to(device), stacking, and slicing all work unchanged
+        (indices are fp32-exact for Nside <= 1024). Consumed by HealpixGrid.
+      - "static": the per-patch crop of the precomputed normalized static
+        physiographic fields (see data/make_static_fields.py), channels-last
+        (H, W, S). Consumed by StaticFields (identity).
+      - "xyz"/"sinusoidal": same coordinate payload as "hash" (their encoders
+        consume the coordinates directly).
+    """
+
+    def __init__(self, patch_path: str | Path, normalizer: Normalizer,
+                 origins_path=None, coords_full_path=None,
+                 geo_input_dim: int = 3, altitude=None,
+                 geo_encoder: str = "hash", healpix_index_path=None):
+        self.patches = np.load(patch_path, mmap_mode="r")
+        self.normalizer = normalizer
+        self.geo = origins_path is not None and coords_full_path is not None
+        if self.geo:
+            self.origins = np.load(origins_path)
+            cf = np.load(coords_full_path)
+            self.lat_full, self.lon_full = cf["lat"], cf["lon"]
+            self.geo_encoder = geo_encoder
+            if geo_encoder == "healpix":
+                hp_path = (Path(healpix_index_path) if healpix_index_path
+                           else Path(coords_full_path).parent / "healpix_index.npz")
+                hp = np.load(hp_path)
+                self.hpx_idx = hp["idx"]   # (L, H, W, 4) int64
+                self.hpx_w = hp["w"]       # (L, H, W, 4) float32
+            if geo_encoder in ("static", "hash_static", "hash_compact_static", "xyz_static", "sinusoidal_static"):
+                sf = np.load(Path(coords_full_path).parent / "static_fields.npz")
+                self.static = sf["fields"]  # (S, H, W) float32, normalized
+            if geo_encoder not in ("healpix", "static"):
+                # hash / hash2d / xyz / sinusoidal / hash_static consume the
+                # coordinates. hash2d is 2-D by definition, so its dim is
+                # derived here rather than trusted from the caller — every
+                # call site passes the config's input_dim, which stays 3 for
+                # the other encoders.
+                from models.geo_encoding import build_patch_coords  # local import
+                self._build_coords = build_patch_coords
+                self.geo_input_dim = 2 if geo_encoder == "hash2d" else geo_input_dim
+                self.altitude = altitude
+
+    def __len__(self) -> int:
+        return len(self.patches)
+
+    def __getitem__(self, i: int):
+        # Copy out of the read-only mmap: from_numpy on a non-writable view is
+        # undefined behavior if the tensor is ever written to.
+        x = torch.from_numpy(np.array(self.patches[i], dtype=np.float32))
+        x = self.normalizer.encode(x)
+        if not self.geo:
+            return x
+        s = x.shape[-1]
+        r, c = int(self.origins[i, 0]), int(self.origins[i, 1])
+        if self.geo_encoder == "healpix":
+            idx = torch.from_numpy(self.hpx_idx[:, r:r + s, c:c + s, :].astype(np.float32))
+            w = torch.from_numpy(np.ascontiguousarray(self.hpx_w[:, r:r + s, c:c + s, :]))
+            return x, torch.cat([idx, w], dim=-1)   # (L, s, s, 8)
+        if self.geo_encoder == "static":
+            crop = np.ascontiguousarray(self.static[:, r:r + s, c:c + s])
+            return x, torch.from_numpy(crop).permute(1, 2, 0)  # (s, s, S)
+        alt = self.altitude if self.geo_input_dim == 4 else None
+        coords = torch.from_numpy(self._build_coords(
+            self.lat_full[r:r + s], self.lon_full[c:c + s], altitude=alt,
+            input_dim=self.geo_input_dim,
+        ))
+        if self.geo_encoder in ("hash_static", "hash_compact_static", "xyz_static", "sinusoidal_static"):
+            crop = np.ascontiguousarray(self.static[:, r:r + s, c:c + s])
+            return x, torch.cat([coords, torch.from_numpy(crop).permute(1, 2, 0)],
+                                dim=-1)                        # (s, s, d + S)
+        return x, coords

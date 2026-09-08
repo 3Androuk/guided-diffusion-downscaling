@@ -1,0 +1,542 @@
+"""Comparison of N guided-diffusion checkpoints on identical test patches.
+
+Originally a geo-vs-baseline pair; now a generic ladder: pass any number of
+checkpoints via --ckpts (names in paths.ckpt_dir or absolute paths) and each
+model receives the geo payload its own config requires (hash coords, healpix
+indices, raw xyz, sinusoidal coords, or static fields), built from the same
+test origins — so the full geo-encoder ladder (no-geo, xyz, sinusoidal,
+static, hash, healpix) compares on identical patches at every ratio, alongside
+bicubic. Reports L2 (RMSE) and the power-spectrum metric; optional per-step
+DDNM projection, --shuffle-geo permutation control, and ensemble metrics
+(ensemble-mean L2, CRPS, spread).
+
+Run (ladder):
+    python -m eval.compare_geo --config config/t2m.yaml --wandb \
+        --ckpts diffusion.pt diffusion_geo.pt diffusion_geo_hpx.pt \
+                diffusion_geo_xyz.pt diffusion_geo_sin.pt diffusion_geo_static.pt
+
+Run (legacy pair):
+    python -m eval.compare_geo --config config/t2m.yaml --project \
+        --geo-ckpt diffusion_geo_hpx.pt --base-ckpt diffusion_geo.pt
+"""
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+import torch  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from data.dataset import PatchDataset, load_norm_stats  # noqa: E402
+from eval.metrics import (crps_per_channel, l2_norm, l2_per_channel,  # noqa: E402
+                          radial_power_spectrum, spectrum_log_l1,
+                          spectrum_log_l1_per_channel)
+from sample.reconstruct import (load_diffusion,  # noqa: E402
+                                load_residual, reconstruct_bicubic,
+                                reconstruct_diffusion, reconstruct_residual)
+from sample.transport import (load_transport,  # noqa: E402
+                              reconstruct_transport)
+from utils import (channel_labels, display_channel, ensure_dir,  # noqa: E402
+                   get_device, init_wandb, load_config, run_name, set_seed)
+
+
+def test_indices(n_total: int, n: int):
+    """Which test patches to score: spread over the WHOLE split, not the head.
+
+    Patches are time-ordered at 8 per field, so range(n) took the first n/8
+    FIELDS -- with n=256 that is ~32 consecutive days of January 2016 out of
+    two available years. Every arm saw identical patches so the rankings stand,
+    but the scores were winter-only and rested on ~32 independent weather
+    states rather than 256. linspace spans all 731 fields at the same cost.
+
+    The SAME indices must feed the truth stack and every geo payload, or a
+    patch is scored against another patch's coordinates.
+    """
+    return np.linspace(0, n_total - 1, min(n, n_total)).astype(int)
+
+
+def _recon(diffusion, model, hf, ratio, rc, eta, coords, batch, label="recon",
+           project=False, seed=None):
+    """Reconstruct hf at `ratio`. `seed` makes the comparison PAIRED.
+
+    The renoise-denoise chain draws fresh noise (models/diffusion.py randn_like)
+    from the global RNG, so two evals of the SAME checkpoint differ: measured
+    0.087% on hpx at 4x between two runs, against a 0.11% gap between the arms
+    being compared. Reseeding before each arm gives every model the identical
+    noise realization (common random numbers), so the noise cancels in the
+    DIFFERENCE between arms even though each absolute number still carries it.
+    """
+    if seed is not None:
+        set_seed(seed)
+    it = range(0, len(hf), batch)
+    try:
+        from tqdm import tqdm
+        it = tqdm(it, desc=label)
+    except ImportError:
+        pass
+    outs = []
+    for i in it:
+        c = None if coords is None else coords[i:i + batch]
+        outs.append(reconstruct_diffusion(diffusion, model, hf[i:i + batch], ratio, rc,
+                                          eta=eta, coords=c, project=project).cpu())
+    return torch.cat(outs, dim=0)
+
+
+def load_any(path, device, ckpt_dir):
+    """Load a checkpoint of ANY family and return a uniform reconstruct closure.
+
+    Three families now share one table, so they must share one protocol: the
+    same test patches, the same paired seeding, the same metrics and the same
+    Bicubic consistency check. Evaluating them with three separate tools would
+    silently compare numbers computed on different patches -- the exact failure
+    the merge step's Bicubic check exists to catch.
+
+    Family is inferred from the checkpoint's own keys rather than the filename:
+      'method'  -> transport (flow matching / stochastic interpolant)
+      'res_std' -> residual diffusion on a deterministic mean (CorrDiff-style)
+      neither   -> plain or geo-conditioned diffusion
+    """
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    cfg_ck = ck["config"]
+
+    if "method" in ck:                                   # transport
+        model, process, cfg_t, method, residual = load_transport(path, device)
+        def rec(hf, ratio, rc, eta, coords, batch, project):
+            return torch.cat([
+                reconstruct_transport(model, process, hf[i:i + batch], ratio,
+                                      cfg_t, method,
+                                      coords=None if coords is None else coords[i:i + batch],
+                                      residual=residual).cpu()
+                for i in range(0, len(hf), batch)])
+        return rec, cfg_ck, f"transport:{method}"
+
+    if "res_std" in ck:                                  # residual diffusion
+        # load_residual returns SIX values and reloads the frozen mean itself
+        # from the name stored at training time -- do not re-load it here.
+        model, diff, cfg_r, res_std, mean_model, mean_geo = load_residual(path, device)
+        def rec(hf, ratio, rc, eta, coords, batch, project):
+            return torch.cat([
+                reconstruct_residual(diff, model, hf[i:i + batch], ratio, res_std,
+                                     n_steps=cfg_r.get("residual", {}).get("n_steps", 100),
+                                     coords=None if coords is None else coords[i:i + batch],
+                                     project=project, mean_model=mean_model,
+                                     mean_geo=mean_geo).cpu()
+                for i in range(0, len(hf), batch)])
+        return rec, cfg_ck, "residual"
+
+    model, diff, cfg_d = load_diffusion(path, device)     # diffusion / geo
+    def rec(hf, ratio, rc, eta, coords, batch, project):
+        return torch.cat([
+            reconstruct_diffusion(diff, model, hf[i:i + batch], ratio, rc, eta=eta,
+                                  coords=None if coords is None else coords[i:i + batch],
+                                  project=project).cpu()
+            for i in range(0, len(hf), batch)])
+    enc = cfg_d["geo"].get("encoder", "hash") if cfg_d.get("geo", {}).get("enabled") else "-"
+    return rec, cfg_ck, f"diffusion:{enc}"
+
+
+def _print_per_channel(tag, row, labels, baseline="Bicubic"):
+    """Per-channel L2 and spectrum for every arm, as a percentage vs baseline.
+
+    Percentages rather than raw numbers because the 20 channels span ~10^6 in
+    magnitude (z500 ~1.4e3, q500 ~1e-3): a column of physical RMSEs cannot be
+    read down the page, whereas "-9.2%" means the same thing on every row.
+    Negative = better than the baseline. Raw values stay in the JSON.
+    """
+    names = [n for n in row if n != baseline]
+    if baseline not in row or not names:
+        return
+    b = row[baseline]
+    w = max(12, max(len(n) for n in names) + 2)
+    print(f"\n  {tag} per channel vs {baseline} "
+          f"(negative = better; L2 = pointwise, spec = scale-by-scale power)")
+    print(f"    {'channel':<10}" + "".join(f"{n:>{w}}" for n in names))
+    print(f"    {'':<10}" + "".join(f"{'L2':>{w // 2}}{'spec':>{w - w // 2}}"
+                                    for _ in names))
+    for i, lab in enumerate(labels):
+        cells = ""
+        for n in names:
+            out = []
+            for key in ("l2_per_channel", "spectrum_log_l1_per_channel"):
+                ref, val = b[key].get(lab), row[n][key].get(lab)
+                out.append("n/a" if not ref or val is None
+                           else f"{100.0 * (val - ref) / ref:+.1f}%")
+            cells += f"{out[0]:>{w // 2}}{out[1]:>{w - w // 2}}"
+        print(f"    {lab:<10}" + cells)
+
+
+def _payload(patch_dir, normalizer, idx, geo_cfg, device):
+    """Geo payload stack for test patches `idx`, per one model's config."""
+    ds = PatchDataset(
+        patch_dir / "test_patches.npy", normalizer,
+        origins_path=patch_dir / "test_origins.npy",
+        coords_full_path=patch_dir / "coords_full.npz",
+        geo_input_dim=geo_cfg["input_dim"], altitude=geo_cfg["altitude"],
+        geo_encoder=geo_cfg.get("encoder", "hash"),
+        healpix_index_path=((patch_dir / geo_cfg["healpix_index"])
+                            if geo_cfg.get("healpix_index") else None),
+    )
+    return torch.stack([ds[int(i)][1] for i in idx]).to(device)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default="config/default.yaml")
+    ap.add_argument("--ckpts", nargs="+", default=None,
+                    help="N checkpoints to compare on identical patches (names in "
+                         "paths.ckpt_dir or absolute paths). Overrides "
+                         "--geo-ckpt/--base-ckpt.")
+    ap.add_argument("--geo-ckpt", default="diffusion_geo.pt",
+                    help="legacy pair mode: model A (may be geo or plain)")
+    ap.add_argument("--base-ckpt", default="diffusion.pt",
+                    help="legacy pair mode: model B (may be geo or plain)")
+    ap.add_argument("--batch", type=int, default=16)
+    ap.add_argument("--wandb", action="store_true",
+                    help="Enable wandb logging (overrides config wandb.enabled).")
+    ap.add_argument("--project", action="store_true",
+                    help="Per-step data-consistency projection: coarsen(x0) == LF "
+                         "enforced at every DDIM step.")
+    ap.add_argument("--shuffle-geo", action="store_true",
+                    help="Permutation control: every geo-conditioned model gets "
+                         "ANOTHER patch's geo payload (same permutation for all "
+                         "models). Genuinely geographic gains should collapse "
+                         "toward no-geo; gains that hold were capacity.")
+    ap.add_argument("--ensemble", type=int, default=1,
+                    help="Ensemble members per patch (>1 adds ensemble-mean L2, "
+                         "CRPS, and spread on a subset of patches).")
+    ap.add_argument("--ensemble-patches", type=int, default=64,
+                    help="How many test patches the ensemble metrics use.")
+    ap.add_argument("--inflate-lambdas", type=str, default=None,
+                    help="Comma-separated variance-inflation factors to sweep: "
+                         "x_i <- mean + lam*(x_i - mean). Applied to the SAME "
+                         "drawn members, so the sweep is free. Leaves the "
+                         "ensemble mean exactly unchanged, so it can only move "
+                         "spread/CRPS, never ensemble-mean L2.")
+    ap.add_argument("--eta", type=float, default=None,
+                    help="Override sample.ddim_eta (DDIM stochasticity) for "
+                         "this eval only. >0 diversifies ensemble members "
+                         "beyond the noise-mixing initialization — the fix for "
+                         "underdispersive ensembles; no retraining involved.")
+    args = ap.parse_args()
+    args.inflate_lambdas = ([float(x) for x in args.inflate_lambdas.split(",")]
+                            if args.inflate_lambdas else None)
+    cfg = load_config(args.config)
+    if args.wandb:
+        cfg.setdefault("wandb", {})["enabled"] = True
+    device = get_device()
+    eta = cfg["sample"]["ddim_eta"] if args.eta is None else args.eta
+
+    patch_dir = Path(cfg["paths"]["patch_dir"])
+    ckpt_dir = Path(cfg["paths"]["ckpt_dir"])
+    results_dir = ensure_dir(cfg["paths"]["results_dir"])
+    normalizer = load_norm_stats(patch_dir)
+    n = min(cfg["eval"]["n_test_patches"],
+            len(PatchDataset(patch_dir / "test_patches.npy", normalizer)))
+
+    # Choose the scored patches ONCE, before anything consumes them: the truth
+    # stack and every model's geo payload must index identically or a patch is
+    # scored against another patch's coordinates.
+    ds_plain = PatchDataset(patch_dir / "test_patches.npy", normalizer)
+    sel = test_indices(len(ds_plain), n)
+    print(f"Scoring {len(sel)} of {len(ds_plain)} test patches, spread over "
+          f"fields {int(sel[0])//8}..{int(sel[-1])//8}")
+
+    # ── Load every checkpoint; each builds the geo payload ITS config needs ─
+    ckpt_names = args.ckpts or [args.geo_ckpt, args.base_ckpt]
+    models = []   # (display name, model, diffusion, coords, encoder tag)
+    seen = {}
+    for name in ckpt_names:
+        path = ckpt_dir / name
+        model, diff, cfg_ck = load_diffusion(path, device)
+        geo_on = cfg_ck.get("geo", {}).get("enabled", False)
+        encoder = cfg_ck["geo"].get("encoder", "hash") if geo_on else "-"
+        coords = _payload(patch_dir, normalizer, sel, cfg_ck["geo"], device) if geo_on else None
+        disp = Path(name).stem
+        if disp in seen:  # same stem from different directories
+            seen[disp] += 1
+            disp = f"{disp}#{seen[disp]}"
+        else:
+            seen[disp] = 1
+        models.append((disp, model, diff, coords, encoder))
+        print(f"  {disp}: {path} (geo={geo_on}, encoder={encoder})")
+    print(f"Comparing {len(models)} checkpoint(s) on {n} patches"
+          f"{' | projection ON' if args.project else ''}"
+          f"{' | SHUFFLED geo payloads' if args.shuffle_geo else ''}")
+
+    if args.shuffle_geo:
+        # One shared permutation (seeded off cfg seed) so every model sees the
+        # SAME location mismatch and the control is reproducible.
+        gen = torch.Generator().manual_seed(int(cfg["seed"]))
+        perm = torch.randperm(n, generator=gen).to(device)
+        models = [(d, m, dif, None if c is None else c[perm], e)
+                  for d, m, dif, c, e in models]
+
+    tag_names = "_vs_".join(d for d, *_ in models) if len(models) <= 2 \
+        else f"{len(models)}way"
+    stem = (f"compare_{tag_names}{'_proj' if args.project else ''}"
+            f"{'_shufgeo' if args.shuffle_geo else ''}")
+    if args.eta is not None:
+        stem += f"_eta{args.eta:g}"
+
+    hf = torch.stack([ds_plain[int(i)] for i in sel]).to(device)
+    hf_phys = normalizer.decode(hf.cpu())
+
+    table, spectra = {}, {"Reference": radial_power_spectrum(hf_phys)}
+    for rc in cfg["sample"]["reconstructions"]:
+        ratio = rc["ratio"]; tag = f"{ratio}x"
+        # Same seed for every arm at a given ratio -> identical noise draws.
+        rseed = int(cfg["seed"]) + 1000 * ratio
+        preds = {disp: _recon(dif, mod, hf, ratio, rc, eta, coords, args.batch,
+                              label=f"{tag} {disp}", project=args.project,
+                              seed=rseed)
+                 for disp, mod, dif, coords, _ in models}
+        preds["Bicubic"] = torch.cat(
+            [reconstruct_bicubic(hf[i:i + args.batch], ratio).cpu()
+             for i in range(0, len(hf), args.batch)])
+        row = {}
+        labels = channel_labels(cfg.get("data", {})) or ["ch0"]
+        disp = display_channel(cfg)
+        for name, p in preds.items():
+            pp = normalizer.decode(p)
+            per_ch = l2_per_channel(pp, hf_phys)          # physical, per channel
+            row[name] = {
+                # Headline: the configured display channel, in ITS physical unit.
+                "l2_display": per_ch[disp] if disp < len(per_ch) else per_ch[0],
+                "display_channel": labels[disp] if disp < len(labels) else "ch0",
+                # Scale-fair pooled score: normalized units, so every channel
+                # contributes on equal footing regardless of its magnitude.
+                "l2_normalized": l2_norm(p, hf.cpu()),
+                # Kept for continuity with older tables, but it mixes units and
+                # is dominated by the largest-magnitude channel — do not headline.
+                "l2_physical_pooled": float(sum(per_ch) / len(per_ch)),
+                "l2_per_channel": {labels[i] if i < len(labels) else f"ch{i}": v
+                                   for i, v in enumerate(per_ch)},
+                # log-spectrum error is scale-invariant (a factor k shifts pred
+                # and truth alike), so pooling channels here IS legitimate.
+                "spectrum_log_l1": spectrum_log_l1(pp, hf_phys),
+                # ... but the pooled mean still hides WHICH variables are
+                # over- or under-sharpened, so keep the split as well.
+                "spectrum_log_l1_per_channel": {
+                    labels[i] if i < len(labels) else f"ch{i}": v
+                    for i, v in enumerate(spectrum_log_l1_per_channel(pp, hf_phys))},
+            }
+            spectra[f"{name} {tag}"] = radial_power_spectrum(pp)
+            r = row[name]
+            print(f"  {tag} {name:28s} | {r['display_channel']} L2 {r['l2_display']:.4f}"
+                  f" | norm-L2 {r['l2_normalized']:.4f}"
+                  f" | spec-logL1 {r['spectrum_log_l1']:.4f}")
+        # Per-channel detail, so it is visible which variables each arm helps.
+        # Both metrics, because they answer different questions: L2 is pointwise
+        # accuracy (is the value right here?) and spectrum_log_l1 is scale-by-
+        # scale power (is the field sharp in the right way?). An arm can win one
+        # and lose the other, and averaging over 20 channels hides that.
+        _print_per_channel(tag, row, labels)
+        table[tag] = row
+        _qualitative(normalizer, hf, preds, ratio, rc,
+                     results_dir / f"{stem}_qualitative_{tag}.png")
+
+    # ── Ensemble metrics (subset of patches; diffusion methods only) ──────
+    if args.ensemble > 1:
+        from eval.metrics import crps_ensemble
+        n_e = min(args.ensemble_patches, len(hf))
+        hf_e, hf_e_phys = hf[:n_e], hf_phys[:n_e]
+        print(f"\nEnsemble metrics: {args.ensemble} members x {n_e} patches")
+        ens = {}
+        for rc in cfg["sample"]["reconstructions"]:
+            ratio = rc["ratio"]; tag = f"{ratio}x"
+            for disp, mod, dif, coords, _ in models:
+                c = None if coords is None else coords[:n_e]
+                members = [normalizer.decode(
+                    _recon(dif, mod, hf_e, ratio, rc, eta, c, args.batch,
+                           label=f"{tag} {disp} member {m + 1}/{args.ensemble}",
+                           project=args.project))
+                    for m in range(args.ensemble)]
+                stack = torch.stack(members)
+                emean = stack.mean(0)
+                row = {
+                    "single_l2": float(np.mean([l2_norm(p, hf_e_phys) for p in members])),
+                    "ensemble_mean_l2": l2_norm(emean, hf_e_phys),
+                    "crps": crps_ensemble(members, hf_e_phys),
+                    "spread": float(stack.std(0).mean()),
+                }
+                # spread is an ABSOLUTE std; only spread/error says whether the
+                # ensemble is calibrated. A reliable K-member ensemble sits near
+                # sqrt(K/(K+1)) (0.94 at K=8), not 1.0.
+                row["spread_over_error"] = row["spread"] / max(row["ensemble_mean_l2"], 1e-12)
+
+                # ── Variance inflation sweep: x_i <- mean + lam (x_i - mean) ──
+                # Zero learned parameters, and it leaves the ensemble mean
+                # EXACTLY unchanged, so ensemble_mean_l2 cannot move and any
+                # CRPS change is pure calibration. Free to sweep: the members
+                # are already drawn, so every lambda reuses one generation pass.
+                if args.inflate_lambdas:
+                    target = float(np.sqrt(args.ensemble / (args.ensemble + 1.0)))
+                    sweep = {}
+                    for lam in args.inflate_lambdas:
+                        infl = [emean + lam * (m - emean) for m in members]
+                        st = torch.stack(infl)
+                        sweep[f"{lam:g}"] = {
+                            "crps": crps_ensemble(infl, hf_e_phys),
+                            "spread": float(st.std(0).mean()),
+                            "ensemble_mean_l2": l2_norm(st.mean(0), hf_e_phys),
+                        }
+                    row["inflation_sweep"] = sweep
+                    best = min(sweep.items(), key=lambda kv: kv[1]["crps"])
+                    row["best_lambda"] = float(best[0])
+                    row["best_lambda_crps"] = best[1]["crps"]
+
+                    # ── PER-CHANNEL lambda ──────────────────────────────────
+                    # A single global lambda is really the optimum for the
+                    # largest-magnitude channels, because pooled CRPS is in
+                    # physical units (msl and the geopotentials dominate;
+                    # humidity contributes nothing). Fitting lambda per channel
+                    # removes that bias, and is still zero-parameter.
+                    base_pc = np.array(crps_per_channel(members, hf_e_phys))
+                    pc = np.stack([
+                        np.array(crps_per_channel(
+                            [emean + lam * (m - emean) for m in members], hf_e_phys))
+                        for lam in args.inflate_lambdas])          # (L, C)
+                    argbest = pc.argmin(axis=0)
+                    lam_pc = [float(args.inflate_lambdas[i]) for i in argbest]
+                    crps_pc = pc.min(axis=0)
+                    row["lambda_per_channel"] = dict(zip(labels, lam_pc))
+                    # Fair aggregate: each channel's CRPS relative to its own
+                    # lambda=1 value, so no channel's magnitude dominates.
+                    one = args.inflate_lambdas.index(1.0) if 1.0 in args.inflate_lambdas else None
+                    ref = pc[one] if one is not None else base_pc
+                    row["crps_gain_per_channel_pct"] = float(
+                        100.0 * np.mean((crps_pc - ref) / ref))
+                    glob = pc[args.inflate_lambdas.index(row["best_lambda"])]
+                    row["crps_gain_globallam_pct"] = float(
+                        100.0 * np.mean((glob - ref) / ref))
+                    print(f"      per-channel lambda: mean CRPS change "
+                          f"{row['crps_gain_per_channel_pct']:+.2f}% vs "
+                          f"{row['crps_gain_globallam_pct']:+.2f}% for the best "
+                          f"GLOBAL lambda (both normalized per channel)")
+                    order = np.argsort(lam_pc)
+                    lo = ", ".join(f"{labels[i]} {lam_pc[i]:g}" for i in order[:4])
+                    hi = ", ".join(f"{labels[i]} {lam_pc[i]:g}" for i in order[-4:])
+                    print(f"        lowest lambda: {lo}")
+                    print(f"        highest lambda: {hi}")
+
+                ens.setdefault(tag, {})[disp] = row
+                print(f"  {tag} {disp:28s} | single L2 {row['single_l2']:.4f} | "
+                      f"ens-mean L2 {row['ensemble_mean_l2']:.4f} | "
+                      f"CRPS {row['crps']:.4f} | spread {row['spread']:.4f} "
+                      f"| spread/err {row['spread_over_error']:.3f}")
+                if args.inflate_lambdas:
+                    print(f"      inflation sweep (target spread/err ~ "
+                          f"{np.sqrt(args.ensemble/(args.ensemble+1.0)):.3f}):")
+                    for lam, v in row["inflation_sweep"].items():
+                        mark = "  <-- best" if float(lam) == row["best_lambda"] else ""
+                        d = 100.0 * (v["crps"] - row["crps"]) / row["crps"]
+                        print(f"        lam {lam:>4} | CRPS {v['crps']:.4f} ({d:+.2f}%) "
+                              f"| spread {v['spread']:.4f} "
+                              f"| spread/err {v['spread']/max(v['ensemble_mean_l2'],1e-12):.3f}"
+                              f"{mark}")
+        table["ensemble"] = ens
+
+    with open(results_dir / f"{stem}.json", "w") as f:
+        json.dump(table, f, indent=2)
+    _plot(spectra, results_dir / f"{stem}_spectrum.png")
+    print(f"\nSaved -> {results_dir / stem}.json, {stem}_spectrum.png, "
+          f"and {stem}_qualitative_*.png")
+
+    wb_run, wandb = init_wandb(cfg, job_type="compare_geo",
+                               extra_config={"n_test_patches": n,
+                                             "ckpts": ckpt_names,
+                                             "projection": args.project,
+                                             "shuffle_geo": args.shuffle_geo,
+                                             "ensemble": args.ensemble},
+                               name=run_name(cfg, "ladder" if len(models) > 2 else "ablation",
+                                             *(d for d, *_ in models),
+                                             "proj" if args.project else "",
+                                             "shufgeo" if args.shuffle_geo else "",
+                                             f"ens{args.ensemble}" if args.ensemble > 1 else "",
+                                             f"eta{args.eta:g}" if args.eta is not None else ""))
+    if wb_run is not None:
+        # Scalars go to the run SUMMARY (columns in the runs table), not log():
+        # a one-shot eval otherwise creates one single-point chart per metric.
+        tbl = wandb.Table(columns=["ratio", "method", "l2", "spectrum_log_l1"])
+        log = {}
+        for tag, row in table.items():
+            if tag == "ensemble":
+                for etag, erow in row.items():
+                    for method, v in erow.items():
+                        for mk, mv in v.items():
+                            wb_run.summary[f"ensemble/{etag}/{method}/{mk}"] = mv
+                continue
+            for method, v in row.items():
+                tbl.add_data(tag, method, v["l2"], v["spectrum_log_l1"])
+                wb_run.summary[f"{tag}/{method}/l2"] = v["l2"]
+                wb_run.summary[f"{tag}/{method}/spectrum_log_l1"] = v["spectrum_log_l1"]
+        log["ablation/table"] = tbl
+        log["ablation/spectrum"] = wandb.Image(str(results_dir / f"{stem}_spectrum.png"))
+        for rc in cfg["sample"]["reconstructions"]:
+            q = results_dir / f"{stem}_qualitative_{rc['ratio']}x.png"
+            if q.exists():
+                log[f"ablation/qualitative_{rc['ratio']}x"] = wandb.Image(str(q))
+            # per-model Input|model|Reference figures
+            for pm in sorted(results_dir.glob(f"{stem}_qualitative_{rc['ratio']}x_*.png")):
+                key = pm.stem.replace(f"{stem}_", "")
+                log[f"ablation/{key}"] = wandb.Image(str(pm))
+        wb_run.log(log)
+        wb_run.finish()
+        print("wandb: ablation run logged")
+
+
+def _qualitative(normalizer, hf, preds, ratio, rc, path, idx=0):
+    """Side-by-side panels on a SHARED color scale (taken from the reference),
+    so residual noise or bias shows as a visible difference instead of being
+    hidden by per-panel autoscaling. Also writes one small Input|model|Reference
+    figure PER model next to the combined panel."""
+    from data.degrade import degrade
+    lf = degrade(hf[idx:idx + 1].cpu(), ratio, rc.get("smooth_sigma", 0.0))
+    ref = normalizer.decode(hf[idx:idx + 1].cpu())[0, 0].numpy()
+    vmin, vmax = float(ref.min()), float(ref.max())
+
+    def _panel_fig(panels, out_path, suptitle):
+        fig, axes = plt.subplots(1, len(panels), figsize=(4.2 * len(panels), 4.2))
+        for ax, (title, t) in zip(np.atleast_1d(axes), panels):
+            ax.imshow(normalizer.decode(t.cpu())[0, 0].numpy(), cmap="RdBu_r",
+                      vmin=vmin, vmax=vmax)
+            ax.set_title(title, fontsize=9)
+            ax.axis("off")
+        fig.suptitle(suptitle)
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=130, bbox_inches="tight")
+        plt.close(fig)
+
+    panels = [("Input (LF)", lf)]
+    for name, p in preds.items():
+        panels.append((name, p[idx:idx + 1]))
+    panels.append(("Reference", hf[idx:idx + 1].cpu()))
+    _panel_fig(panels, path, f"{ratio}x reconstruction (shared color scale)")
+
+    # One figure per model, each with the reference for direct comparison.
+    for name, p in preds.items():
+        safe = name.replace(" ", "_").replace("#", "")
+        _panel_fig([("Input (LF)", lf), (name, p[idx:idx + 1]),
+                    ("Reference", hf[idx:idx + 1].cpu())],
+                   path.with_name(f"{path.stem}_{safe}{path.suffix}"),
+                   f"{ratio}x — {name} vs reference (shared color scale)")
+
+
+def _plot(spectra, path):
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for label, (k, e) in spectra.items():
+        ax.loglog(k[1:], e[1:], "-" if label == "Reference" else "--",
+                  lw=2.2 if label == "Reference" else 1.4, label=label)
+    ax.set_xlabel("wavenumber k"); ax.set_ylabel("E(k)")
+    ax.set_title("Checkpoint comparison: power spectrum")
+    ax.legend(fontsize=7); ax.grid(True, which="both", alpha=0.3)
+    fig.tight_layout(); fig.savefig(path, dpi=130, bbox_inches="tight"); plt.close(fig)
+
+
+if __name__ == "__main__":
+    main()
