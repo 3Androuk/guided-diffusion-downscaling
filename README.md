@@ -33,9 +33,6 @@ Data are read anonymously from the public WeatherBench 2 stores; no data ship
 with this repository. Set `PROJECTDIR` to the directory that holds `datasets/`
 and `results_wb220/`.
 
-The twenty-channel experiments were carried out on the Isambard-AI phase 2
-system provided by the Isambard-AI National AI Research Resource (AIRR).
-
 ## License
 
 MIT, see `LICENSE`.
