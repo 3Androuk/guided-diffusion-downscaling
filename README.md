@@ -30,8 +30,12 @@ downscales ECMWF HRES forecasts against paired analyses.
 - `config/` - the configurations behind every arm reported in the paper
 
 Data are read anonymously from the public WeatherBench 2 stores; no data ship
-with this repository. Set `PROJECTDIR` to the directory that holds `datasets/`
-and `results_wb220/`.
+with this repository. ERA5 training patches come from the ERA5 store via the
+scripts in `data/`; the deployment inputs, the ECMWF HRES `+24 h` forecast and
+the HRES analysis used as paired truth, are downloaded once by
+`data/fetch_nwp.py` from the `hres` and `hres_t0` stores (which also rebuilds
+the missing total-column-water-vapour channel from the humidity column). Set
+`PROJECTDIR` to the directory that holds `datasets/` and `results_wb220/`.
 
 ## License
 
